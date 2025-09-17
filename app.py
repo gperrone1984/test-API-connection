@@ -36,7 +36,7 @@ HEADERS = {
                   "Chrome/124.0 Safari/537.36"
 }
 
-# Prompt completo (solo output HTML)
+# Prompt completo (Gemini può rispondere in HTML; poi lo normalizziamo)
 ITALIAN_PROMPT_PREAMBLE = dedent("""\
 Dobbiamo creare la descrizione di un prodotto. Siamo di Redcare Pharmacy, una farmacia online.
 - Rimani fedele a quello che ti ho scritto.
@@ -101,7 +101,6 @@ def sentence_case_from_all_caps(s: str) -> str:
                 cap_next = True
         return "".join(out)
     t = cap_sentences(low)
-    # ripristina sigle 2-4 lettere (best-effort)
     def restore_acronyms(m):
         return m.group(0).upper()
     t = re.sub(r"\b([a-z]{2,4})\b", restore_acronyms, t)
@@ -110,7 +109,6 @@ def sentence_case_from_all_caps(s: str) -> str:
 def to_capitalized_case_ingredients(s: str) -> str:
     if not s:
         return s
-    # spezza su punti elenco e virgole
     parts = re.split(r"\s*[•\u2022\-\–\—]|,\s*", s)
     cleaned = []
     for p in parts:
@@ -151,15 +149,41 @@ def run_gemini_to_html(model, source_text: str) -> str:
     prompt = f"{ITALIAN_PROMPT_PREAMBLE}\n\n{source_text}"
     resp = model.generate_content(prompt, request_options={"timeout": 60})
     text = getattr(resp, 'text', None) or str(resp)
-    # raccogli solo blocchi <p>...</p>
     parts = re.findall(r"<p[\s\S]*?</p>", text, flags=re.IGNORECASE)
     html = " ".join(parts).strip() if parts else text.strip()
     return html
 
+def run_gemini_shortdesc(model, descr: str) -> str:
+    """Crea una descrizione breve da zero (≤150 caratteri, senza punto finale)."""
+    mini = dedent(f"""\
+    Crea una descrizione breve (massimo 150 caratteri, senza punto finale) basata sul seguente testo.
+    Non copiare letteralmente frasi intere: sintetizza in modo naturale.
+    Testo:
+    {descr}
+    """)
+    try:
+        resp = model.generate_content(mini, request_options={"timeout": 30})
+        s = (getattr(resp, "text", None) or str(resp)).strip()
+        s = re.sub(r"\s+", " ", s)
+        s = s.split("\n")[0].strip()
+        if len(s) > 150:
+            s = s[:150]
+            # tronca pulito
+            for sep in [",", ";", " "]:
+                pos = s.rfind(sep)
+                if pos >= 60:
+                    s = s[:pos]
+                    break
+        return s.rstrip(" .")
+    except Exception:
+        # fallback super-semplice
+        s = re.sub(r"\s+", " ", (descr or "").strip())
+        return s[:150].rstrip(" .")
+
 # ----------------------------
-# Ricerca web per EAN (no Open*Facts)
+# Ricerca web per EAN (no Open*Facts) + estrazione robusta
 # ----------------------------
-def duckduckgo_search_urls(query: str, max_results: int = 6) -> List[str]:
+def duckduckgo_search_urls(query: str, max_results: int = 8) -> List[str]:
     try:
         resp = requests.post("https://duckduckgo.com/html/",
                              data={"q": query}, headers=HEADERS, timeout=20)
@@ -176,73 +200,169 @@ def duckduckgo_search_urls(query: str, max_results: int = 6) -> List[str]:
     except Exception:
         return []
 
-def extract_main_text_from_url(url: str) -> str:
+def extract_jsonld_product(soup: BeautifulSoup) -> List[dict]:
+    out = []
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "")
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            data = [data]
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict) and str(item.get("@type", "")).lower() in {"product", "Product"}:
+                    out.append(item)
+    return out
+
+def extract_main_text_from_url(url: str, ean: Optional[str] = None) -> Tuple[str, bool]:
+    """
+    Ritorna (testo_estratto, match_affidabile_con_ean)
+    - usa Readability per testo
+    - include <title> e meta description
+    - se trova JSON-LD Product con gtin che combacia, marca match=True e include name/description
+    """
     try:
         r = requests.get(url, timeout=25, headers=HEADERS)
         r.raise_for_status()
-        doc = Document(r.text)
+        html_full = r.text
+        soup_full = BeautifulSoup(html_full, "lxml")
+
+        # title + meta description
+        title = (soup_full.title.get_text(" ").strip() if soup_full.title else "")
+        meta_desc = ""
+        md = soup_full.find("meta", attrs={"name": "description"}) or soup_full.find("meta", attrs={"property": "og:description"})
+        if md and md.get("content"):
+            meta_desc = md["content"].strip()
+
+        # JSON-LD Product
+        reliable = False
+        jsonlds = extract_jsonld_product(soup_full)
+        jsonld_bits = []
+        if jsonlds:
+            for item in jsonlds:
+                gtin_fields = [str(item.get("gtin13") or item.get("gtin") or item.get("gtin12") or item.get("gtin14") or item.get("ean") or "")]
+                gtin_fields = [g for g in gtin_fields if g]
+                name = str(item.get("name") or "")
+                desc = str(item.get("description") or "")
+                if ean and any(ean in g for g in gtin_fields):
+                    reliable = True
+                if name or desc:
+                    jsonld_bits.append(f"Nome: {name}\nDescrizione: {desc}")
+
+        # Readability main text
+        doc = Document(html_full)
         html = doc.summary()
         soup = BeautifulSoup(html, 'lxml')
         for tag in soup(['script','style','noscript']):
             tag.decompose()
-        text = soup.get_text(" ")
-        return re.sub(r"\s+", " ", text).strip()
-    except Exception as e:
-        return f"[ERRORE estrazione sito]: {e}"
+        text_readable = re.sub(r"\s+", " ", soup.get_text(" ")).strip()
 
-def fetch_by_ean(ean: str) -> Tuple[str, Dict[str, str]]:
-    queries = [f'"{ean}" sito ufficiale', str(ean)]
+        parts = []
+        if title: parts.append(title)
+        if meta_desc: parts.append(meta_desc)
+        if jsonld_bits: parts.append("\n".join(jsonld_bits))
+        if text_readable: parts.append(text_readable)
+
+        text = "\n\n".join(p for p in parts if p)[:12000]
+
+        # se non abbiamo jsonld affidabile, prova match semplice su pagina
+        if ean and (ean in html_full or ean in text):
+            reliable = True
+
+        return text, reliable
+    except Exception:
+        return "", False
+
+def fetch_by_ean(ean: str) -> Tuple[str, Dict[str, Any]]:
+    # Varianti di query per aumentare recall
+    queries = [
+        f"\"{ean}\"",
+        f"{ean} gtin13",
+        f"{ean} barcode",
+        f"{ean} scheda tecnica",
+        f"{ean} ingredienti",
+        f"{ean} INCI",
+    ]
+    seen = set()
     urls: List[str] = []
     for q in queries:
-        res = duckduckgo_search_urls(q)
-        for u in res:
-            if u not in urls:
-                urls.append(u)
-        if len(urls) >= 8:
+        for u in duckduckgo_search_urls(q, max_results=8):
+            if u not in seen:
+                urls.append(u); seen.add(u)
+            if len(urls) >= 12:
+                break
+        if len(urls) >= 12:
             break
-    texts: List[str] = []
-    for u in urls[:8]:
-        try:
-            t = extract_main_text_from_url(u)
-            if len(t) > 300:
-                texts.append(t)
-        except Exception:
+
+    snippets: List[str] = []
+    good_hits = 0
+    for u in urls:
+        text, reliable = extract_main_text_from_url(u, ean=ean)
+        if not text:
             continue
-    return ("\n\n".join(texts), {"source": "web"})
+        # tieni sempre qualcosa, ma conta hit “buoni”
+        if reliable:
+            good_hits += 1
+            snippets.append(text)
+        else:
+            # prendi solo 1-2 non affidabili per contesto
+            if len([s for s in snippets if "[FALLBACK]" in s]) < 2:
+                snippets.append("[FALLBACK]\n" + text)
+
+        if good_hits >= 3:  # abbastanza materiale affidabile
+            break
+
+    return ("\n\n".join(snippets), {"urls": urls, "good_hits": good_hits})
 
 # ----------------------------
-# Generazione descrizione breve
+# Parsing HTML di Gemini → blocchi → normalizzazione → HTML finale
 # ----------------------------
-def extract_descr_from_html(html: str) -> str:
-    try:
-        soup = BeautifulSoup(html, "lxml")
-        p = soup.find("p")
-        if not p:
-            return ""
-        text = p.get_text(" ").strip()
+def parse_html_blocks(html: str) -> Dict[str, str]:
+    """
+    Estrae: titolo, descrizione_generale (primo <p> dopo <strong><br>), e
+    Modo d'uso / Ingredienti / Avvertenze / Formato dagli altri <p>.
+    """
+    out = {"titolo": "", "descrizione_generale": "", "modo_uso": "", "ingredienti": "", "avvertenze": "", "formato": ""}
+
+    soup = BeautifulSoup(html, "lxml")
+    ps = soup.find_all("p")
+    if not ps:
+        return out
+
+    # Primo paragrafo: titolo + descrizione
+    p0 = ps[0]
+    strong = p0.find("strong")
+    if strong:
+        out["titolo"] = strong.get_text(" ").strip()
+    text_p0 = p0.get_text(" ").strip()
+    if out["titolo"]:
+        text_p0 = text_p0.replace(out["titolo"], "", 1).strip()
+    # rimuovi eventuale prefisso ":" o " - "
+    text_p0 = text_p0.lstrip(" :-")
+    out["descrizione_generale"] = re.sub(r"\s+", " ", text_p0).strip()
+
+    # Altri paragrafi con label
+    for p in ps[1:]:
+        label = ""
         strong = p.find("strong")
         if strong:
-            strong_text = strong.get_text(" ").strip()
-            text = text.replace(strong_text, "", 1).strip()
-        return re.sub(r"\s+", " ", text).strip(" :-")
-    except Exception:
-        return ""
+            label = strong.get_text(" ").strip().lower()
+        content = p.get_text(" ").strip()
+        if strong:
+            content = content.replace(strong.get_text(" ").strip(), "", 1).strip()
+        content = content.lstrip(": -").strip()
+        if "modo d'uso" in label or "modalità d'uso" in label:
+            out["modo_uso"] = content
+        elif "ingredienti" in label or "inci" in label or "composizione" in label:
+            out["ingredienti"] = content
+        elif "avvertenze" in label or "precauzioni" in label or "attenzione" in label:
+            out["avvertenze"] = content
+        elif "formato" in label or "confezione" in label or "contenuto" in label:
+            out["formato"] = content
 
-def make_short_description(descr: str) -> str:
-    s = re.sub(r"\s+", " ", (descr or "").strip())
-    if len(s) <= 150:
-        return s.rstrip(" .")
-    cut = s[:150]
-    for sep in [",", ";", " "]:
-        pos = cut.rfind(sep)
-        if pos >= 60:
-            cut = cut[:pos]
-            break
-    return cut.rstrip(" .")
+    return out
 
-# ----------------------------
-# Costruzione HTML finale
-# ----------------------------
 def build_final_html(blocks: Dict[str, str]) -> str:
     titolo = remove_inner_br((blocks.get('titolo') or '').strip())
     descr  = remove_inner_br((blocks.get('descrizione_generale') or '').strip())
@@ -261,10 +381,9 @@ def build_final_html(blocks: Dict[str, str]) -> str:
         if is_all_caps(val):
             locals()[name] = sentence_case_from_all_caps(val)
 
-    # Fallback Modo d'uso
+    # Fallback
     if not modo:
         modo = "Per il corretto modo d'uso si prega di fare riferimento alla confezione"
-    # Ingredienti
     if not ingr:
         ingr = "Per la lista completa degli ingredienti si prega di fare riferimento alla confezione"
     else:
@@ -299,7 +418,6 @@ def ui_single(model):
     with col2:
         ean = st.text_input("EAN (solo cifre)", placeholder="Es. 8001234567890")
         confirm_ean = False
-        # Mostra sempre la domanda ESATTA se c'è EAN valido e nessun altro input
         if ean and re.fullmatch(r"\d{8,14}", ean) and not raw_text.strip() and not url.strip():
             st.info('Vuoi avere informazioni sul prodotto collegato a questo EAN?')
             confirm_ean = st.checkbox("Sì, procedi", value=False)
@@ -311,14 +429,14 @@ def ui_single(model):
             source_text = raw_text.strip()
 
         elif url.strip():
-            source_text = extract_main_text_from_url(url.strip())
+            source_text = extract_main_text_from_url(url.strip())[0]
 
         elif ean and re.fullmatch(r"\d{8,14}", ean):
             if not confirm_ean:
                 st.error('Vuoi avere informazioni sul prodotto collegato a questo EAN?')
                 st.stop()
-            fetched, _ = fetch_by_ean(ean)
-            if not fetched:
+            fetched, meta = fetch_by_ean(ean)
+            if not fetched or meta.get("good_hits", 0) == 0:
                 st.error("Nessuna informazione trovata per questo EAN nel web.")
                 st.stop()
             source_text = fetched
@@ -327,12 +445,17 @@ def ui_single(model):
             st.warning("Inserisci almeno una sorgente valida (testo, URL o EAN).")
             st.stop()
 
+        # 1) Chiedi a Gemini l'HTML come da prompt
         with st.spinner("Calling Gemini…"):
-            html_out = run_gemini_to_html(model, source_text)
+            html_raw = run_gemini_to_html(model, source_text)
 
-        # Descrizione breve
-        descr_txt = extract_descr_from_html(html_out)
-        short_out = make_short_description(descr_txt)
+        # 2) Parsa l'HTML di Gemini, normalizza casing e ricostruisci nel formato esatto
+        blocks = parse_html_blocks(html_raw)
+        html_out = build_final_html(blocks)
+
+        # 3) Descrizione breve da zero, basata sulla descrizione generale
+        descr_for_short = blocks.get("descrizione_generale", "")
+        short_out = run_gemini_shortdesc(model, descr_for_short)
 
         st.markdown("### #modifica testo (copia con un click)")
         st.code(html_out, language="html")
@@ -350,21 +473,25 @@ def ui_batch(model):
     df = pd.read_excel(file)
     outputs = []
     for idx, row in df.iterrows():
-        html_out = ""
+        src = ""
         if isinstance(row.get('testo'), str) and row['testo'].strip():
-            html_out = run_gemini_to_html(model, row['testo'].strip())
+            src = row['testo'].strip()
         elif isinstance(row.get('url'), str) and row['url'].strip():
-            src = extract_main_text_from_url(str(row['url']).strip())
-            html_out = run_gemini_to_html(model, src)
+            src = extract_main_text_from_url(str(row['url']).strip())[0]
         elif pd.notna(row.get('ean')):
             ean_str = re.sub(r"\D", "", str(row['ean']))
-            fetched, _ = fetch_by_ean(ean_str)
-            if fetched:
-                html_out = run_gemini_to_html(model, fetched)
-        if not html_out:
+            fetched, meta = fetch_by_ean(ean_str)
+            if meta.get("good_hits", 0) > 0:
+                src = fetched
+
+        if not src:
             continue
-        descr_txt = extract_descr_from_html(html_out)
-        short_out = make_short_description(descr_txt)
+
+        html_raw = run_gemini_to_html(model, src)
+        blocks = parse_html_blocks(html_raw)
+        html_out = build_final_html(blocks)
+        short_out = run_gemini_shortdesc(model, blocks.get("descrizione_generale", ""))
+
         outputs.append({'row': idx, 'html': html_out, 'short': short_out})
 
     st.success(f"Generati {len(outputs)} record.")
