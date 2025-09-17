@@ -1,0 +1,8 @@
+streamlit
+google-generativeai
+pandas
+requests
+beautifulsoup4
+lxml
+readability-lxml
+openpyxl
