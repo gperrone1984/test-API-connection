@@ -168,7 +168,6 @@ def run_gemini_shortdesc(model, descr: str) -> str:
         s = s.split("\n")[0].strip()
         if len(s) > 150:
             s = s[:150]
-            # tronca pulito
             for sep in [",", ";", " "]:
                 pos = s.rfind(sep)
                 if pos >= 60:
@@ -176,23 +175,36 @@ def run_gemini_shortdesc(model, descr: str) -> str:
                     break
         return s.rstrip(" .")
     except Exception:
-        # fallback super-semplice
         s = re.sub(r"\s+", " ", (descr or "").strip())
         return s[:150].rstrip(" .")
 
 # ----------------------------
-# Ricerca web per EAN (no Open*Facts) + estrazione robusta
+# EAN SEARCH (NO GOOGLE API) — DuckDuckGo HTML + robust page extraction
 # ----------------------------
+DDG_HEADERS = {
+    "User-Agent": HEADERS["User-Agent"]
+}
+
+SEARCH_BLACKLIST = {
+    "amazon.", "ebay.", "aliexpress.", "pinterest.", "facebook.", "instagram.",
+    "twitter.", "x.com", "tiktok.", "youtube.", "openfoodfacts.", "openbeautyfacts.",
+    "idealo.", "trovaprezzi.", "kelkoo.", "google.", "bing.", "yahoo."
+}
+
+def is_blacklisted(url: str) -> bool:
+    host = url.lower()
+    return any(b in host for b in SEARCH_BLACKLIST)
+
 def duckduckgo_search_urls(query: str, max_results: int = 8) -> List[str]:
     try:
         resp = requests.post("https://duckduckgo.com/html/",
-                             data={"q": query}, headers=HEADERS, timeout=20)
+                             data={"q": query}, headers=DDG_HEADERS, timeout=20)
         resp.raise_for_status()
         s = BeautifulSoup(resp.text, 'lxml')
         urls: List[str] = []
         for a in s.select("a.result__a"):
             href = a.get('href', '')
-            if href and href.startswith("http"):
+            if href and href.startswith("http") and not is_blacklisted(href):
                 urls.append(href)
             if len(urls) >= max_results:
                 break
@@ -204,23 +216,28 @@ def extract_jsonld_product(soup: BeautifulSoup) -> List[dict]:
     out = []
     for script in soup.find_all("script", type="application/ld+json"):
         try:
-            data = json.loads(script.string or "")
+            raw = script.string or ""
+            if not raw.strip():
+                continue
+            data = json.loads(raw)
         except Exception:
             continue
         if isinstance(data, dict):
             data = [data]
         if isinstance(data, list):
             for item in data:
-                if isinstance(item, dict) and str(item.get("@type", "")).lower() in {"product", "Product"}:
+                if not isinstance(item, dict):
+                    continue
+                t = str(item.get("@type", "")).lower()
+                if t in {"product"}:
                     out.append(item)
     return out
 
 def extract_main_text_from_url(url: str, ean: Optional[str] = None) -> Tuple[str, bool]:
     """
-    Ritorna (testo_estratto, match_affidabile_con_ean)
-    - usa Readability per testo
-    - include <title> e meta description
-    - se trova JSON-LD Product con gtin che combacia, marca match=True e include name/description
+    Ritorna (testo_estratto, match_affidabile_con_ean).
+    - Usa: <title>, meta description, JSON-LD Product (gtin/ean), e testo 'readable' (Readability).
+    - 'affidabile' = pagina contiene l'EAN (html/testo) oppure JSON-LD con GTIN uguale all'EAN.
     """
     try:
         r = requests.get(url, timeout=25, headers=HEADERS)
@@ -228,24 +245,27 @@ def extract_main_text_from_url(url: str, ean: Optional[str] = None) -> Tuple[str
         html_full = r.text
         soup_full = BeautifulSoup(html_full, "lxml")
 
-        # title + meta description
+        # Title + meta description
         title = (soup_full.title.get_text(" ").strip() if soup_full.title else "")
         meta_desc = ""
         md = soup_full.find("meta", attrs={"name": "description"}) or soup_full.find("meta", attrs={"property": "og:description"})
         if md and md.get("content"):
             meta_desc = md["content"].strip()
 
-        # JSON-LD Product
+        # JSON-LD Product (match GTIN/EAN)
         reliable = False
         jsonlds = extract_jsonld_product(soup_full)
         jsonld_bits = []
         if jsonlds:
             for item in jsonlds:
-                gtin_fields = [str(item.get("gtin13") or item.get("gtin") or item.get("gtin12") or item.get("gtin14") or item.get("ean") or "")]
-                gtin_fields = [g for g in gtin_fields if g]
+                gtins = []
+                for k in ("gtin13", "gtin", "gtin12", "gtin14", "ean"):
+                    v = item.get(k)
+                    if v:
+                        gtins.append(str(v))
                 name = str(item.get("name") or "")
                 desc = str(item.get("description") or "")
-                if ean and any(ean in g for g in gtin_fields):
+                if ean and any(ean in g for g in gtins):
                     reliable = True
                 if name or desc:
                     jsonld_bits.append(f"Nome: {name}\nDescrizione: {desc}")
@@ -263,10 +283,9 @@ def extract_main_text_from_url(url: str, ean: Optional[str] = None) -> Tuple[str
         if meta_desc: parts.append(meta_desc)
         if jsonld_bits: parts.append("\n".join(jsonld_bits))
         if text_readable: parts.append(text_readable)
-
         text = "\n\n".join(p for p in parts if p)[:12000]
 
-        # se non abbiamo jsonld affidabile, prova match semplice su pagina
+        # match stringa EAN nella pagina (html o testo)
         if ean and (ean in html_full or ean in text):
             reliable = True
 
@@ -275,9 +294,15 @@ def extract_main_text_from_url(url: str, ean: Optional[str] = None) -> Tuple[str
         return "", False
 
 def fetch_by_ean(ean: str) -> Tuple[str, Dict[str, Any]]:
-    # Varianti di query per aumentare recall
+    """
+    Ricerca robusta con DuckDuckGo HTML.
+    - Prova più query (EAN puro, +gtin, +barcode, +scheda tecnica, +ingredienti/INCI).
+    - Tieni le pagine 'affidabili' (contengono EAN o GTIN uguale).
+    - Ritorna un testo aggregato e metadati (conteggio hit affidabili).
+    """
     queries = [
         f"\"{ean}\"",
+        f"{ean} gtin",
         f"{ean} gtin13",
         f"{ean} barcode",
         f"{ean} scheda tecnica",
@@ -290,9 +315,9 @@ def fetch_by_ean(ean: str) -> Tuple[str, Dict[str, Any]]:
         for u in duckduckgo_search_urls(q, max_results=8):
             if u not in seen:
                 urls.append(u); seen.add(u)
-            if len(urls) >= 12:
+            if len(urls) >= 20:
                 break
-        if len(urls) >= 12:
+        if len(urls) >= 20:
             break
 
     snippets: List[str] = []
@@ -301,16 +326,14 @@ def fetch_by_ean(ean: str) -> Tuple[str, Dict[str, Any]]:
         text, reliable = extract_main_text_from_url(u, ean=ean)
         if not text:
             continue
-        # tieni sempre qualcosa, ma conta hit “buoni”
         if reliable:
             good_hits += 1
             snippets.append(text)
         else:
-            # prendi solo 1-2 non affidabili per contesto
-            if len([s for s in snippets if "[FALLBACK]" in s]) < 2:
+            # prendi al massimo 2 fallback non affidabili per contesto
+            if len([s for s in snippets if s.startswith("[FALLBACK]")]) < 2:
                 snippets.append("[FALLBACK]\n" + text)
-
-        if good_hits >= 3:  # abbastanza materiale affidabile
+        if good_hits >= 3:  # sufficiente materiale 'buono'
             break
 
     return ("\n\n".join(snippets), {"urls": urls, "good_hits": good_hits})
@@ -338,7 +361,6 @@ def parse_html_blocks(html: str) -> Dict[str, str]:
     text_p0 = p0.get_text(" ").strip()
     if out["titolo"]:
         text_p0 = text_p0.replace(out["titolo"], "", 1).strip()
-    # rimuovi eventuale prefisso ":" o " - "
     text_p0 = text_p0.lstrip(" :-")
     out["descrizione_generale"] = re.sub(r"\s+", " ", text_p0).strip()
 
@@ -363,6 +385,13 @@ def parse_html_blocks(html: str) -> Dict[str, str]:
 
     return out
 
+def clean_format(value: str) -> str:
+    v = re.sub(r"\s+", " ", (value or "").strip())
+    # accetta solo quantità reali (ml, g, l, capsule, compresse, pz, bustine, ecc.)
+    if re.search(r"\b\d+(?:[.,]\d+)?\s?(ml|g|kg|l|capsule|compresse|pz|bustine|sachets|tavolette)\b", v, re.IGNORECASE):
+        return ensure_trailing_period(v)
+    return ""  # scarta COD/SKU ecc.
+
 def build_final_html(blocks: Dict[str, str]) -> str:
     titolo = remove_inner_br((blocks.get('titolo') or '').strip())
     descr  = remove_inner_br((blocks.get('descrizione_generale') or '').strip())
@@ -381,13 +410,18 @@ def build_final_html(blocks: Dict[str, str]) -> str:
         if is_all_caps(val):
             locals()[name] = sentence_case_from_all_caps(val)
 
-    # Fallback
+    # Fallback Modo d'uso
     if not modo:
         modo = "Per il corretto modo d'uso si prega di fare riferimento alla confezione"
+
+    # Ingredienti
     if not ingr:
         ingr = "Per la lista completa degli ingredienti si prega di fare riferimento alla confezione"
     else:
         ingr = to_capitalized_case_ingredients(ingr)
+
+    # Formato: accetta solo quantità plausibili
+    form = clean_format(form)
 
     # Punti finali
     if descr: descr = ensure_trailing_period(descr)
@@ -405,6 +439,25 @@ def build_final_html(blocks: Dict[str, str]) -> str:
     if form:
         parts.append(f"<p><strong>Formato: </strong><br> {form}</p>")
     return " ".join(parts)
+
+# ----------------------------
+# Generazione descrizione breve
+# ----------------------------
+def extract_descr_from_html(html: str) -> str:
+    try:
+        soup = BeautifulSoup(html, "lxml")
+        p = soup.find("p")
+        if not p:
+            return ""
+        text = p.get_text(" ").strip()
+        strong = p.find("strong")
+        if strong:
+            strong_text = strong.get_text(" ").strip()
+            text = text.replace(strong_text, "", 1).strip()
+        text = re.sub(r"^\s*[:-]\s*", "", text).strip()
+        return re.sub(r"\s+", " ", text)
+    except Exception:
+        return ""
 
 # ----------------------------
 # UI
@@ -429,7 +482,8 @@ def ui_single(model):
             source_text = raw_text.strip()
 
         elif url.strip():
-            source_text = extract_main_text_from_url(url.strip())[0]
+            txt, _ = extract_main_text_from_url(url.strip(), ean=None)
+            source_text = txt or " "
 
         elif ean and re.fullmatch(r"\d{8,14}", ean):
             if not confirm_ean:
@@ -449,11 +503,11 @@ def ui_single(model):
         with st.spinner("Calling Gemini…"):
             html_raw = run_gemini_to_html(model, source_text)
 
-        # 2) Parsa l'HTML di Gemini, normalizza casing e ricostruisci nel formato esatto
+        # 2) Parsa/normalizza e ricostruisci nel formato esatto
         blocks = parse_html_blocks(html_raw)
         html_out = build_final_html(blocks)
 
-        # 3) Descrizione breve da zero, basata sulla descrizione generale
+        # 3) Descrizione breve da zero sulla base della descrizione generale
         descr_for_short = blocks.get("descrizione_generale", "")
         short_out = run_gemini_shortdesc(model, descr_for_short)
 
@@ -477,7 +531,7 @@ def ui_batch(model):
         if isinstance(row.get('testo'), str) and row['testo'].strip():
             src = row['testo'].strip()
         elif isinstance(row.get('url'), str) and row['url'].strip():
-            src = extract_main_text_from_url(str(row['url']).strip())[0]
+            src, _ = extract_main_text_from_url(str(row['url']).strip(), ean=None)
         elif pd.notna(row.get('ean')):
             ean_str = re.sub(r"\D", "", str(row['ean']))
             fetched, meta = fetch_by_ean(ean_str)
