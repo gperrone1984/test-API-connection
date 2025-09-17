@@ -1,16 +1,29 @@
 # streamlit_app.py
-# Requirements (install in your environment):
-#   streamlit, google-generativeai, pandas, requests, beautifulsoup4, lxml, readability-lxml, openpyxl
-# This app builds product descriptions using the Gemini API from: raw text, a website, or an EAN (with explicit consent),
-# or in batch from an Excel file. Output follows the formatting rules provided in Italian.
+# Requirements (put these in requirements.txt for Streamlit Cloud):
+#   streamlit
+#   google-generativeai>=0.7.0
+#   pandas
+#   requests
+#   beautifulsoup4
+#   lxml
+#   readability-lxml
+#   openpyxl
+#
+# Secrets (Streamlit Cloud → Settings → Secrets):
+#   GOOGLE_API_KEY = "la_tua_chiave"
+#
+# Funzioni principali:
+# - Input: Testo / URL / EAN (con domanda di consenso obbligatoria).
+# - EAN: prova Open*Facts; se vuoto, cerca sul web e concatena snippet pertinenti.
+# - URL: tenta di catturare INCI/Ingredienti anche quando sono in sezioni separate.
+# - Output: formato HTML conforme alle regole #modifica testo + Descrizione breve (≤150 caratteri, senza punto finale).
 
 import os
 import re
 import io
 import json
-import time
 import zipfile
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 
 import streamlit as st
 import pandas as pd
@@ -24,7 +37,7 @@ except Exception:
     genai = None
 
 # ----------------------------
-# Helpers
+# Costanti & Helpers
 # ----------------------------
 TITLE = "Product Description Builder (Gemini)"
 
@@ -34,19 +47,18 @@ ITALIAN_PROMPT_PREAMBLE = (
     "#imput\n"
     "- Se incollo un testo utilizza solo le informazioni che ci sono nel testo senza inventare nulla.\n"
     "- Se incollo un sito web ricordati che ho i diritti per utilizzare i contenuti. Quindi non inventare nulla. Utilizza solo il sito che ti do. Se non trovi le informazioni non inventare nulla.\n"
-    "- Se incollo un EAN di un prodotto, prima di procedere devo aver dato il consenso esplicito: 'Vuoi avere informazioni sul prodotto collegato a questo EAN?'.\n"
-    "- Trova solo informazioni collegate all'EAN fornito. Il prodotto deve essere effettivamente quello collegato a quell'EAN.\n"
-    "- Quando crei una descrizione da un EAN per la descrizione generale parafrasa quello che prendi da altri siti, non copiare esattamente i contenuti da un sito a meno che non sia quello del produttore.\n\n"
-    "#modifica testo (FORMATTAZIONE OBBLIGATORIA)\n"
-    "- NON aggiungere fonti nel testo.\n"
+    "- Se incollo un EAN di un prodotto NON SCRIVERE NULLA: Prima chiedimi se voglio cercare le informazioni del prototto collegate all`EAN. La domanda da fare è ESCLUSIVAMENTE: \"Vuoi avere informazioni sul prodotto collegato a questo EAN?\"\n"
+    "- Trova tutte le informazioni che riesci online collegato SOLO all´EAN che ti fornisco. Il prodotto deve essere effettivamente quello collegato all´EAN.\n"
+    "- Quando crei una descrizione da un EAN per la descrizione generale parafrasa quello che prendi da altri siti, non posso copiare esattamente i contenuti da un sito  a meno che non sia quello del produttore.\n\n"
+    "#modifica testo\n"
+    "- Nei prossimi passaggi Il testo inserito non deve essere modificato, solo copiato. Non aggiungere o inventare nulla.\n"
     "- Fai un passaggio per volta.\n"
-    "- Il titolo è la parte prima di 'descrizione' o 'Indicazioni'. Il titolo deve essere in Capitalized Case.\n"
-    "- Sotto il titolo va la descrizione generale, senza l'etichetta 'descrizione'.\n"
-    "- Modo d'uso: se mancante usa la frase esatta: 'Per il corretto modo d'uso si prega di fare riferimento alla confezione'.\n"
-    "- Ingredienti: converti il testo degli ingredienti in Capitalized Case, in forma impersonale; se mancano usa la frase esatta: 'Per la lista completa degli ingredienti si prega di fare riferimento alla confezione'.\n"
-    "- Avvertenze: includi solo se presenti.\n"
-    "- Per i dispositivi medici, se presente, aggiungi il Formato.\n"
-    "- Aggiungi un breve riassunto (<150 caratteri) alla fine come 'descrizione breve' senza punto finale.\n\n"
+    "- Il titolo è la parte prima di 'descrizione' o 'Indicazioni'. Il testo deve essere in Capitalized Case. aggiungi <p><strong> prima del titolo e </strong><br> dopo del titolo. Elimina i <br> all'interno del testo\n"
+    "- Sotto il titolo va la descrizione generale del prodotto. Direttamente sotto il titolo, senza scrivere descrizione. Alla fine aggiungi </p>\n"
+    "- In Modo d'uso: devi prendere il testo di Modalità d'uso. Se la modalità d'uso/modo dúso manca utilizza la seguente frase: 'Per il corretto modo d'uso si prega di fare riferimento alla confezione'. Aggiungi <p><strong> prima di Modo d'uso: e </strong><br> alla fine. Alla fine di tutto metti </p>\n"
+    "- In Ingredienti: vanno Ingredienti o componenti. Converti il testo degli ingredienti in capitalized case.  Gli ingredienti devono essere in una forma impersonale. Se gli ingredienti mancano inserire la frase: Per la lista completa degli ingredienti si prega di fare riferimento alla confezione.  Aggiungi <p><strong> prima di Ingredienti: e </strong> <br> alla fine. Alla fine di tutto metti </p>. Converti il testo degli ingredienti in capitalized case. Non mettere in capitalized case la frase: Per la lista completa degli ingredienti si prega di fare riferimento alla confezione.\n"
+    "- In Avvertenze: vanno Avvertenze. Aggiungi <p><strong> prima di Avvertenze: e </strong> <br> alla fine. Alla fine di tutto metti </p>. Se le Avvertenze non ci sono non scrivere nulla.\n"
+    "- Per i dispositivi medici se presenti aggiungi il Formato, Aggiungi <p><strong> prima di Formato: e </strong> <br> alla fine. Alla fine di tutto metti </p>. Se il Formato non c´é non scrivere nulla.\n\n"
     "#Output richiesto\n"
     "Restituisci un JSON con le seguenti chiavi (usa stringhe vuote se mancanti):\n"
     "{\"titolo\": str, \"descrizione_generale\": str, \"modo_uso\": str, \"ingredienti\": str, \"avvertenze\": str, \"formato\": str, \"descrizione_breve\": str}"
@@ -56,17 +68,23 @@ ELEGANT_DIVIDER = """\n---\n"""
 
 EAN_QUESTION = "Vuoi avere informazioni sul prodotto collegato a questo EAN?"
 
-# Capitalized Case util: capitalize first letter of each substantive word, keep acronyms
 LOWER_WORDS_IT = {
     "di","a","da","in","con","su","per","tra","fra","e","o","dei","degli","delle","del","della","dell'","delle","agli","alle","al","allo","ai","lo","la","le","il","un","uno","una","ed","od"
 }
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+}
+
+# ----------------------------
+# Utilities
+# ----------------------------
 
 def to_capitalized_case(text: str) -> str:
     def fix_token(tok: str) -> str:
         if not tok:
             return tok
-        if re.fullmatch(r"[A-Z0-9]{2,}", tok):  # acronym / code
+        if re.fullmatch(r"[A-Z0-9]{2,}", tok):
             return tok
         base = re.sub(r"^([\W_]*)(.*?)([\W_]*)$", r"\1:::\2:::\3", tok)
         pre, core, post = base.split(":::")
@@ -87,40 +105,44 @@ def ensure_trailing_period(s: str) -> str:
 
 
 def remove_inner_br(text: str) -> str:
-    # Remove <br> inside provided text to comply with rule "Elimina i <br> all'interno del testo"
     return re.sub(r"<\s*br\s*/?>", " ", text, flags=re.IGNORECASE)
 
 
 # ----------------------------
-# Gemini
+# Gemini setup & call
 # ----------------------------
+
+def get_api_key_from_env_or_secrets() -> Optional[str]:
+    if 'GOOGLE_API_KEY' in st.secrets:
+        return st.secrets['GOOGLE_API_KEY']
+    return os.getenv('GOOGLE_API_KEY')
+
 
 def get_gemini_model(api_key: str, model_name: str = "gemini-1.5-flash"):
     if genai is None:
-        raise RuntimeError("google-generativeai is not installed.")
+        raise RuntimeError("google-generativeai non è installato.")
     genai.configure(api_key=api_key)
     return genai.GenerativeModel(model_name)
 
 
 def run_gemini_extraction(model, source_text: str) -> Dict[str, str]:
     prompt = ITALIAN_PROMPT_PREAMBLE + "\n\n#testo\n" + source_text
-    resp = model.generate_content(prompt)
-    text = resp.text if hasattr(resp, 'text') else str(resp)
-    # Try to extract JSON from response
+    try:
+        resp = model.generate_content(prompt, request_options={"timeout": 60})
+    except Exception as e:
+        st.error(f"Errore chiamando Gemini: {e}")
+        raise
+    text = getattr(resp, 'text', None) or str(resp)
     m = re.search(r"\{[\s\S]*\}$", text.strip())
     if m:
         text = m.group(0)
     try:
         data = json.loads(text)
-        # Ensure all keys
-        keys = [
-            "titolo","descrizione_generale","modo_uso","ingredienti","avvertenze","formato","descrizione_breve"
-        ]
+        keys = ["titolo","descrizione_generale","modo_uso","ingredienti","avvertenze","formato","descrizione_breve"]
         for k in keys:
             data.setdefault(k, "")
         return {k: (data.get(k) or "").strip() for k in keys}
     except Exception:
-        # Fallback: return everything in descrizione_generale to avoid failure
         return {
             "titolo": "",
             "descrizione_generale": text.strip(),
@@ -133,29 +155,84 @@ def run_gemini_extraction(model, source_text: str) -> Dict[str, str]:
 
 
 # ----------------------------
-# Source acquisition (URL / EAN)
+# Source acquisition (URL / EAN) + Web Search
 # ----------------------------
 
+def extract_ingredients_sections(soup: BeautifulSoup) -> str:
+    """Tenta di estrarre blocchi Ingredienti/INCI/Composizione dal DOM."""
+    labels = ["ingredienti", "inci", "composizione", "componenti"]
+    texts: List[str] = []
+    for tag in soup.find_all(["h1","h2","h3","h4","h5","strong","b","p","span"]):
+        t = (tag.get_text(" ") or "").strip().lower()
+        if any(lbl in t for lbl in labels):
+            nxts = []
+            if tag.name not in ("strong","b"):
+                nxts.append(tag)
+            for sib in list(tag.next_siblings)[:5]:
+                if getattr(sib, 'name', None) in ("ul","ol","p","div","span","table"):
+                    nxts.append(sib)
+            par = tag.parent
+            if par and par != tag and par.name in ("p","div","section","li"):
+                nxts.append(par)
+            chunk = []
+            for el in nxts:
+                try:
+                    chunk.append(el.get_text(" ").strip())
+                except Exception:
+                    continue
+            block = " ".join(chunk).strip()
+            if block:
+                texts.append(block)
+    out, seen = [], set()
+    for t in texts:
+        if t and t not in seen:
+            out.append(t); seen.add(t)
+    return " \n".join(out)[:4000]
+
+
 def extract_main_text_from_url(url: str) -> str:
+    """Estrae testo leggibile e prova a preservare sezioni come Ingredienti/INCI."""
     try:
-        r = requests.get(url, timeout=20)
+        r = requests.get(url, timeout=25, headers=HEADERS)
         r.raise_for_status()
         doc = Document(r.text)
         html = doc.summary()
         soup = BeautifulSoup(html, 'lxml')
         for tag in soup(['script','style','noscript']):
             tag.decompose()
+        ingr = extract_ingredients_sections(soup)
         text = soup.get_text(" ")
-        # Clean excessive whitespace
         text = re.sub(r"\s+", " ", text).strip()
-        return text[:20000]  # limit
+        if ingr and 'ingredient' not in text.lower():
+            text = text + " \n\nIngredienti: " + ingr
+        return text[:24000]
     except Exception as e:
         return f"[ERRORE estrazione sito]: {e}"
 
 
+def duckduckgo_search_urls(query: str, max_results: int = 6) -> list:
+    """Ricerca semplice (senza API key) su DuckDuckGo HTML e ritorna URL dei risultati."""
+    try:
+        resp = requests.post("https://duckduckgo.com/html/", data={"q": query}, headers=HEADERS, timeout=20)
+        resp.raise_for_status()
+        s = BeautifulSoup(resp.text, 'lxml')
+        urls = []
+        for a in s.select("a.result__a"):
+            href = a.get('href', '')
+            if href and href.startswith("http"):
+                urls.append(href)
+            if len(urls) >= max_results:
+                break
+        return urls
+    except Exception:
+        return []
+
+
 def fetch_by_ean(ean: str) -> Tuple[str, Dict[str, Any]]:
-    """Attempt to fetch product data by EAN using public sources (e.g., OpenFoodFacts). Returns (text, raw_json)."""
-    # OpenFoodFacts (foods/cosmetics sometimes)
+    """Cerca dati prodotto per EAN.
+    1) Open*Facts (food/beauty/pet);
+    2) se vuoto, ricerca web e concatena snippet di pagine pertinenti.
+    Ritorna (testo_di_lavoro, debug_json)."""
     endpoints = [
         f"https://world.openfoodfacts.org/api/v0/product/{ean}.json",
         f"https://world.openbeautyfacts.org/api/v0/product/{ean}.json",
@@ -163,7 +240,7 @@ def fetch_by_ean(ean: str) -> Tuple[str, Dict[str, Any]]:
     ]
     for url in endpoints:
         try:
-            r = requests.get(url, timeout=15)
+            r = requests.get(url, timeout=15, headers=HEADERS)
             if r.status_code == 200:
                 data = r.json()
                 if data.get('status') == 1 and 'product' in data:
@@ -172,65 +249,66 @@ def fetch_by_ean(ean: str) -> Tuple[str, Dict[str, Any]]:
                     brand = p.get('brands', '')
                     qty = p.get('quantity', '')
                     ingredients = p.get('ingredients_text_it') or p.get('ingredients_text') or ''
-                    desc_bits = [b for b in [name, brand, qty, ingredients] if b]
-                    joined = "; ".join(desc_bits)
+                    bits = [b for b in [name, brand, qty, ingredients] if b]
+                    joined = "; ".join(bits)
                     if joined:
-                        return joined, data
+                        return joined, {"source": "openfacts", "raw": data}
         except Exception:
-            pass
-    # If nothing found
-    return "", {}
+            continue
+
+    snippets, seen = [], set()
+    urls = duckduckgo_search_urls(f"{ean} sito ufficiale") or duckduckgo_search_urls(ean)
+    for u in urls[:6]:
+        if u in seen:
+            continue
+        seen.add(u)
+        try:
+            txt = extract_main_text_from_url(u)
+            if ean in txt or len(txt) > 300:
+                snippets.append(f"[URL] {u}\n{txt[:6000]}")
+        except Exception:
+            continue
+    return ("\n\n".join(snippets), {"source": "web", "urls": urls})
 
 
 # ----------------------------
-# Formatting according to rules (#modifica testo)
+# Formattazione finale (#modifica testo)
 # ----------------------------
 
 def build_final_html(blocks: Dict[str, str]) -> str:
     titolo = to_capitalized_case(remove_inner_br(blocks.get('titolo','').strip()))
-    descr = remove_inner_br(blocks.get('descrizione_generale','').strip())
-    modo = remove_inner_br(blocks.get('modo_uso','').strip())
-    ingr = remove_inner_br(blocks.get('ingredienti','').strip())
-    avv = remove_inner_br(blocks.get('avvertenze','').strip())
-    form = remove_inner_br(blocks.get('formato','').strip())
+    descr  = remove_inner_br(blocks.get('descrizione_generale','').strip())
+    modo   = remove_inner_br(blocks.get('modo_uso','').strip())
+    ingr   = remove_inner_br(blocks.get('ingredienti','').strip())
+    avv    = remove_inner_br(blocks.get('avvertenze','').strip())
+    form   = remove_inner_br(blocks.get('formato','').strip())
 
-    # Fallbacks as required
     if not modo:
         modo = "Per il corretto modo d'uso si prega di fare riferimento alla confezione"
     if not ingr:
         ingr = "Per la lista completa degli ingredienti si prega di fare riferimento alla confezione"
 
-    # Capitalize required fields
     if titolo:
         titolo = to_capitalized_case(titolo)
     if ingr and not ingr.startswith("Per la lista completa"):
         ingr = to_capitalized_case(ingr)
 
-    # Ensure period at end of each paragraph
     descr = ensure_trailing_period(descr) if descr else descr
-    modo = ensure_trailing_period(modo) if modo else modo
-    if ingr and not ingr.startswith("Per la lista completa"):
+    modo  = ensure_trailing_period(modo)  if modo  else modo
+    if ingr:
         ingr = ensure_trailing_period(ingr)
-    elif ingr:
-        ingr = ensure_trailing_period(ingr)
-    avv = ensure_trailing_period(avv) if avv else avv
-    form = ensure_trailing_period(form) if form else form
+    avv   = ensure_trailing_period(avv)   if avv   else avv
+    form  = ensure_trailing_period(form)  if form  else form
 
     parts = []
-    if titolo:
-        parts.append(f"<p><strong>{titolo}</strong><br>")
-    else:
-        parts.append("<p><strong></strong><br>")
+    parts.append(f"<p><strong>{titolo}</strong><br>")
     parts.append(f"{descr}</p>")
-
     parts.append(f"<p><strong>Modo d'uso:</strong><br> {modo}</p>")
     parts.append(f"<p><strong>Ingredienti:</strong> <br> {ingr}</p>")
-
     if avv:
         parts.append(f"<p><strong>Avvertenze:</strong> <br> {avv}</p>")
     if form:
         parts.append(f"<p><strong>Formato:</strong> <br> {form}</p>")
-
     return "\n".join(parts)
 
 
@@ -239,51 +317,45 @@ def trim_short_description(s: str) -> str:
     s = re.sub(r"\s+", " ", s)
     if len(s) > 150:
         s = s[:150]
-        # avoid cutting mid-word if possible
         s = re.sub(r"\s\S*$", "", s).strip()
-    # Must NOT end with a period
-    s = s.rstrip(" .")
-    return s
+    return s.rstrip(" .")
 
 
 # ----------------------------
-# Streamlit UI
+# UI
 # ----------------------------
 
 def ui_single(model):
     st.subheader("Single Input")
-    st.markdown("Provide exactly one of the following: **Text**, **Website URL**, or **EAN**.")
+    st.markdown("Fornisci uno tra **Testo**, **URL** o **EAN**.")
 
     col1, col2 = st.columns(2)
     with col1:
-        raw_text = st.text_area("Text (Italian preferred)", height=180, placeholder="Incolla qui il testo da cui prendere le informazioni…")
+        raw_text = st.text_area("Testo", height=180, placeholder="Incolla qui il testo da cui prendere le informazioni…")
         url = st.text_input("Website URL", placeholder="https://…")
     with col2:
-        ean = st.text_input("EAN (digits only)", placeholder="Es. 8001234567890")
+        ean = st.text_input("EAN (solo cifre)", placeholder="Es. 8001234567890")
         confirm_ean = False
         if ean and re.fullmatch(r"\d{8,14}", ean) and not raw_text.strip() and not url.strip():
             st.info(EAN_QUESTION)
             confirm_ean = st.button("Sì, procedi")
 
-    if st.button("Build Description", type="primary") or (ean and confirm_ean):
-        source_text = ""
-        source_kind = None
+    do_build = st.button("Build Description", type="primary")
 
+    if do_build or (ean and confirm_ean):
+        source_text = ""
         if raw_text.strip():
             source_text = raw_text.strip()
-            source_kind = "text"
         elif url.strip():
             source_text = extract_main_text_from_url(url.strip())
-            source_kind = "url"
         elif ean and re.fullmatch(r"\d{8,14}", ean):
             if not confirm_ean:
-                st.stop()  # respect rule: ask for explicit consent first
+                st.stop()
             fetched, _ = fetch_by_ean(ean)
             if not fetched:
-                st.error("Nessuna informazione trovata per questo EAN.")
+                st.warning("Nessuna informazione pubblica trovata per questo EAN dalle fonti supportate. Incolla l'URL del produttore o del sito autorizzato.")
                 st.stop()
             source_text = f"[FONTE: EAN {ean}] " + fetched
-            source_kind = "ean"
         else:
             st.warning("Inserisci almeno una sorgente valida (testo, URL o EAN).")
             st.stop()
@@ -295,8 +367,7 @@ def ui_single(model):
         short_out = trim_short_description(blocks.get("descrizione_breve", "") or blocks.get("descrizione_generale", ""))
 
         st.markdown("### #modifica testo (copia con un click)")
-        st.code(html_out, language="html")  # copy button enabled
-
+        st.code(html_out, language="html")
         st.markdown(ELEGANT_DIVIDER)
         st.markdown("### Descrizione breve (≤150 caratteri)")
         st.write(short_out)
@@ -304,7 +375,7 @@ def ui_single(model):
 
 def ui_batch(model):
     st.subheader("Batch via Excel")
-    st.write("Upload an Excel file with columns (any subset): **titolo, descrizione_generale, modo_uso, ingredienti, avvertenze, formato, testo, url, ean**. If `testo`/`url`/`ean` are present, the model will derive the fields. Otherwise, the provided columns will be used as-is.")
+    st.write("Carica un Excel con colonne (facoltative): **titolo, descrizione_generale, modo_uso, ingredienti, avvertenze, formato, testo, url, ean**.")
 
     file = st.file_uploader("Upload Excel", type=["xlsx","xls"])
     if not file:
@@ -327,7 +398,6 @@ def ui_batch(model):
         if src_text:
             blocks = run_gemini_extraction(model, src_text)
         else:
-            # Use direct columns without inventing anything
             blocks = {
                 'titolo': str(row.get('titolo') or ''),
                 'descrizione_generale': str(row.get('descrizione_generale') or ''),
@@ -341,22 +411,16 @@ def ui_batch(model):
         html_out = build_final_html(blocks)
         short_out = trim_short_description(blocks.get("descrizione_breve", "") or blocks.get("descrizione_generale", ""))
 
-        outputs.append({
-            'row': idx,
-            'html': html_out,
-            'short': short_out
-        })
+        outputs.append({'row': idx, 'html': html_out, 'short': short_out})
 
-    # Show sample and make ZIP
-    st.success(f"Generated {len(outputs)} record(s).")
+    st.success(f"Generati {len(outputs)} record.")
     if outputs:
-        st.markdown("#### Preview (first 3)")
+        st.markdown("#### Preview (primi 3)")
         for o in outputs[:3]:
             st.code(o['html'], language='html')
             st.write("**Descrizione breve:** ", o['short'])
             st.markdown(ELEGANT_DIVIDER)
 
-        # Build ZIP of per-row .html and .txt
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
             for o in outputs:
@@ -381,16 +445,18 @@ def main():
 
     with st.sidebar:
         st.markdown("### Gemini Settings")
-        api_key = st.text_input("Google API Key", type="password", help="Create one in Google AI Studio and paste it here.")
+        preset_api = get_api_key_from_env_or_secrets()
+        api_key = st.text_input("Google API Key", type="password", value=preset_api or "")
         model_name = st.selectbox("Model", ["gemini-1.5-flash", "gemini-1.5-pro"])
-        st.caption("The model is used only to rephrase/extract strictly from provided sources.")
+        st.caption("La chiave nei Secrets ha priorità; questo campo è un fallback.")
 
     if not api_key:
-        st.info("Enter your Google API Key to begin.")
+        st.info("Inserisci la Google API Key o configura i Secrets.")
         return
 
     try:
         model = get_gemini_model(api_key, model_name)
+        st.session_state['model'] = model
     except Exception as e:
         st.error(f"Errore nell'inizializzazione di Gemini: {e}")
         return
