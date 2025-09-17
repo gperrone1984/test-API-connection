@@ -98,7 +98,7 @@ def remove_inner_br(text: str) -> str:
 def get_gemini_model(api_key: str, model_name: str = "gemini-1.5-flash"):
     if genai is None:
         raise RuntimeError("google-generativeai is not installed.")
-        genai.configure(api_key=api_key)
+    genai.configure(api_key=api_key)
     return genai.GenerativeModel(model_name)
 
 
