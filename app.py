@@ -106,6 +106,24 @@ def sentence_case_from_all_caps(s: str) -> str:
     t = re.sub(r"\b([a-z]{2,4})\b", restore_acronyms, t)
     return t
 
+def normalize_sentence_case(text: str) -> str:
+    """Forza sempre il sentence case (evita output urlato di Gemini)."""
+    if not text:
+        return ""
+    s = text.lower()
+    out = []
+    cap_next = True
+    for ch in s:
+        if cap_next and ch.isalpha():
+            out.append(ch.upper()); cap_next = False
+        else:
+            out.append(ch)
+        if ch in ".!?":
+            cap_next = True
+    s = "".join(out)
+    s = re.sub(r"\b([a-z]{2,4})\b", lambda m: m.group(1).upper(), s)  # ripristina sigle corte
+    return s
+
 def to_capitalized_case_ingredients(s: str) -> str:
     if not s:
         return s
@@ -404,17 +422,9 @@ def build_final_html(blocks: Dict[str, str]) -> str:
     if titolo:
         titolo = to_capitalized_case(titolo)
 
-    # Normalizza sezioni se ricevute ALL CAPS
-    for name in ["descr", "modo", "avv", "form"]:
-        val = locals()[name]
-        if is_all_caps(val):
-            locals()[name] = sentence_case_from_all_caps(val)
-
-    # Fallback Modo d'uso
+    # Fallback Modo d'uso / Ingredienti
     if not modo:
         modo = "Per il corretto modo d'uso si prega di fare riferimento alla confezione"
-
-    # Ingredienti
     if not ingr:
         ingr = "Per la lista completa degli ingredienti si prega di fare riferimento alla confezione"
     else:
@@ -422,6 +432,11 @@ def build_final_html(blocks: Dict[str, str]) -> str:
 
     # Formato: accetta solo quantità plausibili
     form = clean_format(form)
+
+    # Normalizza SEMPRE in sentence case (evita maiuscolo urlato)
+    for name in ["descr", "modo", "avv", "form"]:
+        val = locals()[name]
+        locals()[name] = normalize_sentence_case(val)
 
     # Punti finali
     if descr: descr = ensure_trailing_period(descr)
