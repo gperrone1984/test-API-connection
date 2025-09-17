@@ -17,6 +17,9 @@ try:
 except Exception:
     genai = None
 
+# ----------------------------
+# Config & Costanti
+# ----------------------------
 TITLE = "Product Description Builder (Gemini)"
 ELEGANT_DIVIDER = "\n---\n"
 EAN_QUESTION = "Vuoi avere informazioni sul prodotto collegato a questo EAN?"
@@ -33,7 +36,7 @@ HEADERS = {
                   "Chrome/124.0 Safari/537.36"
 }
 
-# Prompt completo
+# Prompt completo (solo output HTML)
 ITALIAN_PROMPT_PREAMBLE = dedent("""\
 Dobbiamo creare la descrizione di un prodotto. Siamo di Redcare Pharmacy, una farmacia online.
 - Rimani fedele a quello che ti ho scritto.
@@ -59,7 +62,7 @@ Per i dispositivi medici se presenti aggiungi il Formato, Aggiungi <p><strong> p
 """)
 
 # ----------------------------
-# Utils
+# Helpers di formattazione / casing
 # ----------------------------
 def to_capitalized_case(text: str) -> str:
     def fix_token(tok: str) -> str:
@@ -67,14 +70,72 @@ def to_capitalized_case(text: str) -> str:
             return tok
         if re.fullmatch(r"[A-Z0-9]{2,}", tok):
             return tok
-        base = re.sub(r"^([\\W_]*)(.*?)([\\W_]*)$", r"\\1:::\\2:::\\3", tok)
+        base = re.sub(r"^([\W_]*)(.*?)([\W_]*)$", r"\1:::\2:::\3", tok)
         pre, core, post = base.split(":::")
         if core.lower() in LOWER_WORDS_IT:
             return f"{pre}{core.lower()}{post}"
         return f"{pre}{core[:1].upper()}{core[1:].lower()}{post}"
-    tokens = re.split(r"(\\s+)", text.strip())
+    tokens = re.split(r"(\s+)", text.strip())
     return ''.join([fix_token(t) if not t.isspace() else t for t in tokens])
 
+def remove_inner_br(text: str) -> str:
+    return re.sub(r"<\s*br\s*/?>", " ", text, flags=re.IGNORECASE)
+
+def is_all_caps(s: str) -> bool:
+    letters = re.sub(r"[^A-Za-zÀ-ÖØ-öø-ÿ]", "", s or "")
+    return bool(letters) and letters.upper() == letters
+
+def sentence_case_from_all_caps(s: str) -> str:
+    if not s:
+        return s
+    low = s.lower()
+    def cap_sentences(t: str) -> str:
+        out = []
+        cap_next = True
+        for ch in t:
+            if cap_next and ch.isalpha():
+                out.append(ch.upper()); cap_next = False
+            else:
+                out.append(ch)
+            if ch in ".!?":
+                cap_next = True
+        return "".join(out)
+    t = cap_sentences(low)
+    # ripristina sigle 2-4 lettere (best-effort)
+    def restore_acronyms(m):
+        return m.group(0).upper()
+    t = re.sub(r"\b([a-z]{2,4})\b", restore_acronyms, t)
+    return t
+
+def to_capitalized_case_ingredients(s: str) -> str:
+    if not s:
+        return s
+    # spezza su punti elenco e virgole
+    parts = re.split(r"\s*[•\u2022\-\–\—]|,\s*", s)
+    cleaned = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        tokens = p.split()
+        fixed = []
+        for tok in tokens:
+            if len(tok) <= 4 and tok.isupper():
+                fixed.append(tok)  # lascia INCI/sigle corte
+            else:
+                fixed.append(to_capitalized_case(tok))
+        cleaned.append(" ".join(fixed))
+    return ", ".join(cleaned)
+
+def ensure_trailing_period(s: str) -> str:
+    s = (s or "").strip()
+    if not s:
+        return s
+    return s if s.endswith(('.', '!', '?')) else s + '.'
+
+# ----------------------------
+# Gemini setup & call
+# ----------------------------
 def get_api_key_from_env_or_secrets() -> Optional[str]:
     if 'GOOGLE_API_KEY' in st.secrets:
         return st.secrets['GOOGLE_API_KEY']
@@ -86,19 +147,17 @@ def get_gemini_model(api_key: str, model_name: str = "gemini-1.5-flash"):
     genai.configure(api_key=api_key)
     return genai.GenerativeModel(model_name)
 
-# ----------------------------
-# Gemini
-# ----------------------------
 def run_gemini_to_html(model, source_text: str) -> str:
     prompt = f"{ITALIAN_PROMPT_PREAMBLE}\n\n{source_text}"
     resp = model.generate_content(prompt, request_options={"timeout": 60})
     text = getattr(resp, 'text', None) or str(resp)
-    parts = re.findall(r"<p[\\s\\S]*?</p>", text, flags=re.IGNORECASE)
+    # raccogli solo blocchi <p>...</p>
+    parts = re.findall(r"<p[\s\S]*?</p>", text, flags=re.IGNORECASE)
     html = " ".join(parts).strip() if parts else text.strip()
     return html
 
 # ----------------------------
-# Web Search by EAN
+# Ricerca web per EAN (no Open*Facts)
 # ----------------------------
 def duckduckgo_search_urls(query: str, max_results: int = 6) -> List[str]:
     try:
@@ -127,13 +186,13 @@ def extract_main_text_from_url(url: str) -> str:
         for tag in soup(['script','style','noscript']):
             tag.decompose()
         text = soup.get_text(" ")
-        return re.sub(r"\\s+", " ", text).strip()
+        return re.sub(r"\s+", " ", text).strip()
     except Exception as e:
         return f"[ERRORE estrazione sito]: {e}"
 
 def fetch_by_ean(ean: str) -> Tuple[str, Dict[str, str]]:
     queries = [f'"{ean}" sito ufficiale', str(ean)]
-    urls = []
+    urls: List[str] = []
     for q in queries:
         res = duckduckgo_search_urls(q)
         for u in res:
@@ -141,7 +200,7 @@ def fetch_by_ean(ean: str) -> Tuple[str, Dict[str, str]]:
                 urls.append(u)
         if len(urls) >= 8:
             break
-    texts = []
+    texts: List[str] = []
     for u in urls[:8]:
         try:
             t = extract_main_text_from_url(u)
@@ -152,22 +211,25 @@ def fetch_by_ean(ean: str) -> Tuple[str, Dict[str, str]]:
     return ("\n\n".join(texts), {"source": "web"})
 
 # ----------------------------
-# Short description from HTML
+# Generazione descrizione breve
 # ----------------------------
 def extract_descr_from_html(html: str) -> str:
     try:
-        m = re.search(r"<p>\\s*<strong>.*?</strong><br>\\s*(.*?)</p>",
-                      html, flags=re.IGNORECASE|re.DOTALL)
-        if not m:
+        soup = BeautifulSoup(html, "lxml")
+        p = soup.find("p")
+        if not p:
             return ""
-        frag = m.group(1)
-        txt = BeautifulSoup(frag, "lxml").get_text(" ")
-        return re.sub(r"\\s+", " ", txt).strip()
+        text = p.get_text(" ").strip()
+        strong = p.find("strong")
+        if strong:
+            strong_text = strong.get_text(" ").strip()
+            text = text.replace(strong_text, "", 1).strip()
+        return re.sub(r"\s+", " ", text).strip(" :-")
     except Exception:
         return ""
 
 def make_short_description(descr: str) -> str:
-    s = re.sub(r"\\s+", " ", (descr or "").strip())
+    s = re.sub(r"\s+", " ", (descr or "").strip())
     if len(s) <= 150:
         return s.rstrip(" .")
     cut = s[:150]
@@ -179,35 +241,88 @@ def make_short_description(descr: str) -> str:
     return cut.rstrip(" .")
 
 # ----------------------------
+# Costruzione HTML finale
+# ----------------------------
+def build_final_html(blocks: Dict[str, str]) -> str:
+    titolo = remove_inner_br((blocks.get('titolo') or '').strip())
+    descr  = remove_inner_br((blocks.get('descrizione_generale') or '').strip())
+    modo   = remove_inner_br((blocks.get('modo_uso') or '').strip())
+    ingr   = remove_inner_br((blocks.get('ingredienti') or '').strip())
+    avv    = remove_inner_br((blocks.get('avvertenze') or '').strip())
+    form   = remove_inner_br((blocks.get('formato') or '').strip())
+
+    # Titolo in Capitalized Case
+    if titolo:
+        titolo = to_capitalized_case(titolo)
+
+    # Normalizza sezioni se ricevute ALL CAPS
+    for name in ["descr", "modo", "avv", "form"]:
+        val = locals()[name]
+        if is_all_caps(val):
+            locals()[name] = sentence_case_from_all_caps(val)
+
+    # Fallback Modo d'uso
+    if not modo:
+        modo = "Per il corretto modo d'uso si prega di fare riferimento alla confezione"
+    # Ingredienti
+    if not ingr:
+        ingr = "Per la lista completa degli ingredienti si prega di fare riferimento alla confezione"
+    else:
+        ingr = to_capitalized_case_ingredients(ingr)
+
+    # Punti finali
+    if descr: descr = ensure_trailing_period(descr)
+    if modo:  modo  = ensure_trailing_period(modo)
+    if ingr:  ingr  = ensure_trailing_period(ingr)
+    if avv:   avv   = ensure_trailing_period(avv)
+    if form:  form  = ensure_trailing_period(form)
+
+    parts = []
+    parts.append(f"<p><strong>{titolo}</strong><br> {descr}</p>")
+    parts.append(f"<p><strong>Modo d'uso: </strong><br> {modo}</p>")
+    parts.append(f"<p><strong>Ingredienti: </strong><br> {ingr}</p>")
+    if avv:
+        parts.append(f"<p><strong>Avvertenze: </strong><br> {avv}</p>")
+    if form:
+        parts.append(f"<p><strong>Formato: </strong><br> {form}</p>")
+    return " ".join(parts)
+
+# ----------------------------
 # UI
 # ----------------------------
 def ui_single(model):
     st.subheader("Single Input")
     col1, col2 = st.columns(2)
     with col1:
-        raw_text = st.text_area("Testo", height=180,
-                                placeholder="Incolla qui il testo…")
+        raw_text = st.text_area("Testo", height=180, placeholder="Incolla qui il testo…")
         url = st.text_input("Website URL", placeholder="https://…")
     with col2:
         ean = st.text_input("EAN (solo cifre)", placeholder="Es. 8001234567890")
         confirm_ean = False
-        if ean and re.fullmatch(r"\\d{8,14}", ean) and not raw_text.strip() and not url.strip():
-            st.info(EAN_QUESTION)
-            confirm_ean = st.button("Sì, procedi")
+        # Mostra sempre la domanda ESATTA se c'è EAN valido e nessun altro input
+        if ean and re.fullmatch(r"\d{8,14}", ean) and not raw_text.strip() and not url.strip():
+            st.info('Vuoi avere informazioni sul prodotto collegato a questo EAN?')
+            confirm_ean = st.checkbox("Sì, procedi", value=False)
 
-    if st.button("Build Description", type="primary") or (ean and confirm_ean):
+    build = st.button("Build Description", type="primary")
+
+    if build:
         if raw_text.strip():
             source_text = raw_text.strip()
+
         elif url.strip():
             source_text = extract_main_text_from_url(url.strip())
-        elif ean and re.fullmatch(r"\\d{8,14}", ean):
+
+        elif ean and re.fullmatch(r"\d{8,14}", ean):
             if not confirm_ean:
+                st.error('Vuoi avere informazioni sul prodotto collegato a questo EAN?')
                 st.stop()
             fetched, _ = fetch_by_ean(ean)
             if not fetched:
                 st.error("Nessuna informazione trovata per questo EAN nel web.")
                 st.stop()
             source_text = fetched
+
         else:
             st.warning("Inserisci almeno una sorgente valida (testo, URL o EAN).")
             st.stop()
@@ -215,6 +330,7 @@ def ui_single(model):
         with st.spinner("Calling Gemini…"):
             html_out = run_gemini_to_html(model, source_text)
 
+        # Descrizione breve
         descr_txt = extract_descr_from_html(html_out)
         short_out = make_short_description(descr_txt)
 
@@ -226,6 +342,8 @@ def ui_single(model):
 
 def ui_batch(model):
     st.subheader("Batch via Excel")
+    st.write("Carica un Excel con colonne (almeno una tra testo/url/ean): "
+             "**titolo, descrizione_generale, modo_uso, ingredienti, avvertenze, formato, testo, url, ean**.")
     file = st.file_uploader("Upload Excel", type=["xlsx","xls"])
     if not file:
         return
@@ -239,7 +357,7 @@ def ui_batch(model):
             src = extract_main_text_from_url(str(row['url']).strip())
             html_out = run_gemini_to_html(model, src)
         elif pd.notna(row.get('ean')):
-            ean_str = re.sub(r"\\D", "", str(row['ean']))
+            ean_str = re.sub(r"\D", "", str(row['ean']))
             fetched, _ = fetch_by_ean(ean_str)
             if fetched:
                 html_out = run_gemini_to_html(model, fetched)
@@ -249,7 +367,7 @@ def ui_batch(model):
         short_out = make_short_description(descr_txt)
         outputs.append({'row': idx, 'html': html_out, 'short': short_out})
 
-    st.success(f"Generated {len(outputs)} record(s).")
+    st.success(f"Generati {len(outputs)} record.")
     if outputs:
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
