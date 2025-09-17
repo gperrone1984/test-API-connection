@@ -4,6 +4,7 @@ import io
 import json
 import zipfile
 from typing import Optional, Tuple, Dict, Any, List
+from urllib.parse import urlparse, parse_qs, unquote
 
 import streamlit as st
 import pandas as pd
@@ -92,7 +93,6 @@ def to_capitalized_case(text: str) -> str:
         if re.fullmatch(r"[A-Z0-9]{2,}", core):
             fixed_core = core  # sigla → lascia
         else:
-            # separa eventuali trattini/apostrofi interni
             parts = re.split(r"([\-’'\\/])", core)
             new_parts = []
             for p in parts:
@@ -215,36 +215,68 @@ def is_blacklisted(url: str) -> bool:
     host = url.lower()
     return any(b in host for b in SEARCH_BLACKLIST)
 
+def _normalize_ddg_href(href: str) -> Optional[str]:
+    """
+    Converte gli href di DuckDuckGo in URL puliti.
+    - Accetta href http/https reali
+    - Gestisce redirect /l/?... con parametro uddg (URL-encoded)
+    """
+    if not href:
+        return None
+    href = href.strip()
+    if href.startswith("http://") or href.startswith("https://"):
+        return href
+    if href.startswith("/l/?") or href.startswith("https://duckduckgo.com/l/?") or href.startswith("http://duckduckgo.com/l/?"):
+        try:
+            parsed = urlparse(href)
+            qs = parse_qs(parsed.query)
+            uddg = qs.get("uddg", [None])[0]
+            if uddg:
+                return unquote(uddg)
+        except Exception:
+            return None
+    return None
+
 def duckduckgo_search_urls(query: str, max_results: int = 8) -> List[str]:
-    """Tenta prima /lite (GET), poi /html (POST)."""
+    """
+    Cerca su DuckDuckGo senza API:
+    - Prova /lite (GET) e poi /html (POST)
+    - Converte i link DDG (/l/?...&uddg=) in URL reali
+    - Filtra blacklist (marketplace/social/meta-motori)
+    """
     urls: List[str] = []
+
+    # 1) /lite
     try:
         r = requests.get("https://duckduckgo.com/lite/", params={"q": query}, headers=DDG_HEADERS, timeout=20)
         r.raise_for_status()
         s = BeautifulSoup(r.text, "lxml")
         for a in s.select("a[href]"):
-            href = a.get("href", "")
-            if href.startswith("http") and not is_blacklisted(href):
-                urls.append(href)
+            real = _normalize_ddg_href(a.get("href", ""))
+            if real and not is_blacklisted(real) and real not in urls:
+                urls.append(real)
             if len(urls) >= max_results:
                 break
     except Exception:
         pass
+
+    # 2) /html
     if len(urls) < max_results:
         try:
             resp = requests.post("https://duckduckgo.com/html/", data={"q": query}, headers=DDG_HEADERS, timeout=20)
             resp.raise_for_status()
-            s = BeautifulSoup(resp.text, 'lxml')
-            for a in s.select("a.result__a[href]"):
-                href = a.get('href', '')
-                if href.startswith("http") and not is_blacklisted(href):
-                    if href not in urls:
-                        urls.append(href)
+            s = BeautifulSoup(resp.text, "lxml")
+            candidates = s.select("a.result__a[href]") or s.select("a[href]")
+            for a in candidates:
+                real = _normalize_ddg_href(a.get("href", ""))
+                if real and not is_blacklisted(real) and real not in urls:
+                    urls.append(real)
                 if len(urls) >= max_results:
                     break
         except Exception:
             pass
-    return urls
+
+    return urls[:max_results]
 
 def extract_jsonld_product(soup: BeautifulSoup) -> List[dict]:
     out = []
@@ -260,17 +292,14 @@ def extract_jsonld_product(soup: BeautifulSoup) -> List[dict]:
             data = [data]
         if isinstance(data, list):
             for item in data:
-                if not isinstance(item, dict):
-                    continue
-                t = str(item.get("@type", "")).lower()
-                if t in {"product"}:
+                if isinstance(item, dict) and str(item.get("@type", "")).lower() == "product":
                     out.append(item)
     return out
 
 def extract_main_text_from_url(url: str, ean: Optional[str] = None) -> Tuple[str, bool]:
     """
     Ritorna (testo_estratto, match_affidabile_con_ean).
-    Affidabile = pagina contiene l'EAN o JSON-LD Product con GTIN/ EAN uguale.
+    Affidabile = pagina contiene l'EAN o JSON-LD Product con GTIN/EAN uguale.
     """
     try:
         r = requests.get(url, timeout=25, headers=HEADERS)
@@ -498,7 +527,6 @@ def ui_single(model):
         manual_urls = st.text_area("URL aggiuntivi (uno per riga, es. sito produttore)", height=80, placeholder="https://…\nhttps://…")
     with col2:
         ean_input = st.text_input("EAN (solo cifre)", placeholder="Es. 8001234567890")
-        # normalizza EAN (solo cifre)
         ean = re.sub(r"\D", "", ean_input or "")
         confirm_ean = False
         if ean and re.fullmatch(r"\d{8,14}", ean) and not raw_text.strip() and not url.strip():
@@ -509,7 +537,6 @@ def ui_single(model):
     build = st.button("Build Description", type="primary")
 
     if build:
-        # 1) Sorgente: testo, URL, EAN (in questo ordine)
         if raw_text.strip():
             source_text = raw_text.strip()
 
@@ -550,15 +577,15 @@ def ui_single(model):
             st.warning("Inserisci almeno una sorgente valida (testo, URL o EAN).")
             st.stop()
 
-        # 2) Chiedi a Gemini l'HTML come da prompt
+        # 1) Chiedi a Gemini l'HTML come da prompt
         with st.spinner("Calling Gemini…"):
             html_raw = run_gemini_to_html(model, source_text)
 
-        # 3) Parsa/normalizza e ricostruisci nel formato esatto
+        # 2) Parsa/normalizza e ricostruisci nel formato esatto
         blocks = parse_html_blocks(html_raw)
         html_out = build_final_html(blocks)
 
-        # 4) Descrizione breve da zero sulla base della descrizione generale
+        # 3) Descrizione breve da zero sulla base della descrizione generale
         descr_for_short = blocks.get("descrizione_generale", "")
         short_out = run_gemini_shortdesc(model, descr_for_short)
 
