@@ -14,9 +14,9 @@
 #
 # Funzioni principali:
 # - Input: Testo / URL / EAN (con domanda di consenso obbligatoria).
-# - EAN: prova Open*Facts; se vuoto, cerca sul web e concatena snippet pertinenti.
-# - URL: tenta di catturare INCI/Ingredienti anche quando sono in sezioni separate.
-# - Output: formato HTML conforme alle regole #modifica testo + Descrizione breve (≤150 caratteri, senza punto finale).
+# - URL: copia ESATTA del contenuto del sito (no parafrasi), organizzato nelle sezioni.
+# - EAN: prova Open*Facts; se vuoto, cerca sul web e concatena snippet pertinenti, poi Gemini struttura/parafrasa.
+# - Output: formato HTML conforme alle regole (#modifica testo) + Descrizione breve (≤150 caratteri, senza punto finale).
 
 import os
 import re
@@ -69,7 +69,7 @@ ELEGANT_DIVIDER = """\n---\n"""
 EAN_QUESTION = "Vuoi avere informazioni sul prodotto collegato a questo EAN?"
 
 LOWER_WORDS_IT = {
-    "di","a","da","in","con","su","per","tra","fra","e","o","dei","degli","delle","del","della","dell'","delle","agli","alle","al","allo","ai","lo","la","le","il","un","uno","una","ed","od"
+    "di","a","da","in","con","su","per","tra","fra","e","o","dei","degli","delle","del","della","dell'","agli","alle","al","allo","ai","lo","la","le","il","un","uno","una","ed","od"
 }
 
 HEADERS = {
@@ -126,13 +126,26 @@ def get_gemini_model(api_key: str, model_name: str = "gemini-1.5-flash"):
 
 
 def run_gemini_extraction(model, source_text: str) -> Dict[str, str]:
-    prompt = ITALIAN_PROMPT_PREAMBLE + "\n\n#testo\n" + source_text
-    try:
-        resp = model.generate_content(prompt, request_options={"timeout": 60})
-    except Exception as e:
-        st.error(f"Errore chiamando Gemini: {e}")
-        raise
+    # Modalità speciale per URL: copia esatta (niente parafrasi) tramite marker opzionale
+    site_mode = False
+    marker = "[DA_SITO: COPIA_ESATTA]"
+    if source_text.startswith(marker):
+        site_mode = True
+        source_text = source_text[len(marker):].lstrip()
+
+    extra = ""
+    if site_mode:
+        extra = (
+            "\n\n[ISTRUZIONI PER SITO]\n"
+            "- NON parafrasare il contenuto della descrizione generale: copia il testo esattamente come appare nella sorgente (salvo le trasformazioni richieste in #modifica testo).\n"
+            "- Mappa il contenuto nelle sezioni richieste: titolo, descrizione_generale, modo_uso, ingredienti, avvertenze, formato.\n"
+            "- Se una sezione non è presente nel sito, lasciala vuota (applicheremo i fallback dove previsti).\n"
+        )
+
+    prompt = ITALIAN_PROMPT_PREAMBLE + extra + "\n\n#testo\n" + source_text
+    resp = model.generate_content(prompt, request_options={"timeout": 60})
     text = getattr(resp, 'text', None) or str(resp)
+
     m = re.search(r"\{[\s\S]*\}$", text.strip())
     if m:
         text = m.group(0)
@@ -168,7 +181,7 @@ def extract_ingredients_sections(soup: BeautifulSoup) -> str:
             nxts = []
             if tag.name not in ("strong","b"):
                 nxts.append(tag)
-            for sib in list(tag.next_siblings)[:5]:
+            for sib in list(tag.next_siblings)[:6]:
                 if getattr(sib, 'name', None) in ("ul","ol","p","div","span","table"):
                     nxts.append(sib)
             par = tag.parent
@@ -210,13 +223,78 @@ def extract_main_text_from_url(url: str) -> str:
         return f"[ERRORE estrazione sito]: {e}"
 
 
-def duckduckgo_search_urls(query: str, max_results: int = 6) -> list:
-    """Ricerca semplice (senza API key) su DuckDuckGo HTML e ritorna URL dei risultati."""
+# Helpers to copy exact content from websites into fields (no paraphrase)
+
+def find_first_text(soup: BeautifulSoup, selectors: List[str]) -> str:
+    for sel in selectors:
+        node = soup.select_one(sel)
+        if node:
+            txt = node.get_text(" ").strip()
+            if txt:
+                return txt
+    return ""
+
+
+def extract_section_by_label(soup: BeautifulSoup, labels: List[str]) -> str:
+    for tag in soup.find_all(["h1","h2","h3","h4","h5","strong","b","p","span"]):
+        t = (tag.get_text(" ") or "").strip().lower()
+        if any(lbl in t for lbl in labels):
+            chunks = []
+            if tag.name not in ("strong","b"):
+                chunks.append(tag.get_text(" ").strip())
+            for sib in list(tag.next_siblings)[:6]:
+                if getattr(sib, 'name', None) in ("ul","ol","p","div","span","table"):
+                    chunks.append(sib.get_text(" ").strip())
+            t_all = " ".join([c for c in chunks if c]).strip()
+            if t_all:
+                for lbl in labels:
+                    t_all = re.sub(rf"(?i){re.escape(lbl)}\s*[:|-]*\s*", "", t_all).strip()
+                return t_all
+    return ""
+
+
+def extract_fields_from_url(url: str) -> Dict[str, str]:
+    try:
+        r = requests.get(url, timeout=25, headers=HEADERS)
+        r.raise_for_status()
+        doc = Document(r.text)
+        html = doc.summary()
+        soup = BeautifulSoup(html, "lxml")
+        for t in soup(["script","style","noscript"]):
+            t.decompose()
+        titolo = find_first_text(soup, ["h1", "header h1", "h1.product-title"]) or find_first_text(soup, ["title"]) or ""
+        descr = find_first_text(soup, ["article p", ".product-description p", ".content p", "main p", "p"]) or ""
+        modo  = extract_section_by_label(soup, ["modo d'uso", "modalità d'uso"]) or ""
+        ingr  = extract_section_by_label(soup, ["ingredienti", "inci", "composizione", "componenti"]) or ""
+        avv   = extract_section_by_label(soup, ["avvertenze", "precauzioni", "attenzione"]) or ""
+        form  = extract_section_by_label(soup, ["formato", "confezione", "contenuto"]) or ""
+        return {
+            "titolo": titolo,
+            "descrizione_generale": descr,
+            "modo_uso": modo,
+            "ingredienti": ingr,
+            "avvertenze": avv,
+            "formato": form,
+            "descrizione_breve": ""
+        }
+    except Exception as e:
+        return {
+            "titolo": "",
+            "descrizione_generale": f"[ERRORE estrazione sito]: {e}",
+            "modo_uso": "",
+            "ingredienti": "",
+            "avvertenze": "",
+            "formato": "",
+            "descrizione_breve": ""
+        }
+
+
+def duckduckgo_search_urls(query: str, max_results: int = 6) -> List[str]:
     try:
         resp = requests.post("https://duckduckgo.com/html/", data={"q": query}, headers=HEADERS, timeout=20)
         resp.raise_for_status()
         s = BeautifulSoup(resp.text, 'lxml')
-        urls = []
+        urls: List[str] = []
         for a in s.select("a.result__a"):
             href = a.get('href', '')
             if href and href.startswith("http"):
@@ -229,10 +307,7 @@ def duckduckgo_search_urls(query: str, max_results: int = 6) -> list:
 
 
 def fetch_by_ean(ean: str) -> Tuple[str, Dict[str, Any]]:
-    """Cerca dati prodotto per EAN.
-    1) Open*Facts (food/beauty/pet);
-    2) se vuoto, ricerca web e concatena snippet di pagine pertinenti.
-    Ritorna (testo_di_lavoro, debug_json)."""
+    """Cerca dati prodotto per EAN: Open*Facts → (se vuoto) web search + snippet."""
     endpoints = [
         f"https://world.openfoodfacts.org/api/v0/product/{ean}.json",
         f"https://world.openbeautyfacts.org/api/v0/product/{ean}.json",
@@ -256,6 +331,7 @@ def fetch_by_ean(ean: str) -> Tuple[str, Dict[str, Any]]:
         except Exception:
             continue
 
+    # Web search fallback
     snippets, seen = [], set()
     urls = duckduckgo_search_urls(f"{ean} sito ufficiale") or duckduckgo_search_urls(ean)
     for u in urls[:6]:
@@ -301,15 +377,14 @@ def build_final_html(blocks: Dict[str, str]) -> str:
     form  = ensure_trailing_period(form)  if form  else form
 
     parts = []
-    parts.append(f"<p><strong>{titolo}</strong><br>")
-    parts.append(f"{descr}</p>")
-    parts.append(f"<p><strong>Modo d'uso:</strong><br> {modo}</p>")
-    parts.append(f"<p><strong>Ingredienti:</strong> <br> {ingr}</p>")
+    parts.append(f"<p><strong>{titolo}</strong><br> {descr}</p>")
+    parts.append(f"<p><strong>Modo d'uso: </strong><br> {modo}</p>")
+    parts.append(f"<p><strong>Ingredienti: </strong><br> {ingr}</p>")
     if avv:
-        parts.append(f"<p><strong>Avvertenze:</strong> <br> {avv}</p>")
+        parts.append(f"<p><strong>Avvertenze: </strong><br> {avv}</p>")
     if form:
-        parts.append(f"<p><strong>Formato:</strong> <br> {form}</p>")
-    return "\n".join(parts)
+        parts.append(f"<p><strong>Formato: </strong><br> {form}</p>")
+    return " ".join(parts)
 
 
 def trim_short_description(s: str) -> str:
@@ -321,14 +396,19 @@ def trim_short_description(s: str) -> str:
     return s.rstrip(" .")
 
 
+def normalize_short(short_from_model: str, fallback: str) -> str:
+    val = (short_from_model or "").strip()
+    if val.lower() in ("undefined", "null", "n/a", "-") or not val:
+        val = (fallback or "").strip()
+    return trim_short_description(val)
+
+
 # ----------------------------
 # UI
 # ----------------------------
 
 def ui_single(model):
     st.subheader("Single Input")
-    st.markdown("Fornisci uno tra **Testo**, **URL** o **EAN**.")
-
     col1, col2 = st.columns(2)
     with col1:
         raw_text = st.text_area("Testo", height=180, placeholder="Incolla qui il testo da cui prendere le informazioni…")
@@ -340,31 +420,31 @@ def ui_single(model):
             st.info(EAN_QUESTION)
             confirm_ean = st.button("Sì, procedi")
 
-    do_build = st.button("Build Description", type="primary")
-
-    if do_build or (ean and confirm_ean):
-        source_text = ""
+    if st.button("Build Description", type="primary") or (ean and confirm_ean):
         if raw_text.strip():
-            source_text = raw_text.strip()
+            # Testo incollato → Gemini per strutturare rispettando le regole
+            with st.spinner("Calling Gemini…"):
+                blocks = run_gemini_extraction(model, raw_text.strip())
+
         elif url.strip():
-            source_text = extract_main_text_from_url(url.strip())
+            # URL → copia ESATTA (no parafrasi): estrai campi e NON usare Gemini
+            blocks = extract_fields_from_url(url.strip())
+
         elif ean and re.fullmatch(r"\d{8,14}", ean):
             if not confirm_ean:
                 st.stop()
             fetched, _ = fetch_by_ean(ean)
             if not fetched:
-                st.warning("Nessuna informazione pubblica trovata per questo EAN dalle fonti supportate. Incolla l'URL del produttore o del sito autorizzato.")
+                st.error("Nessuna informazione pubblica trovata per questo EAN. Incolla l'URL del produttore o di un sito autorizzato.")
                 st.stop()
-            source_text = f"[FONTE: EAN {ean}] " + fetched
+            with st.spinner("Calling Gemini…"):
+                blocks = run_gemini_extraction(model, f"[FONTE: EAN {ean}] {fetched}")
         else:
             st.warning("Inserisci almeno una sorgente valida (testo, URL o EAN).")
             st.stop()
 
-        with st.spinner("Calling Gemini…"):
-            blocks = run_gemini_extraction(model, source_text)
-
         html_out = build_final_html(blocks)
-        short_out = trim_short_description(blocks.get("descrizione_breve", "") or blocks.get("descrizione_generale", ""))
+        short_out = normalize_short(blocks.get("descrizione_breve"), blocks.get("descrizione_generale"))
 
         st.markdown("### #modifica testo (copia con un click)")
         st.code(html_out, language="html")
@@ -386,17 +466,21 @@ def ui_batch(model):
 
     for idx, row in df.iterrows():
         src_text = ""
+        blocks: Dict[str, str]
+
         if isinstance(row.get('testo'), str) and row['testo'].strip():
             src_text = row['testo'].strip()
+            blocks = run_gemini_extraction(model, src_text)
         elif isinstance(row.get('url'), str) and row['url'].strip():
-            src_text = extract_main_text_from_url(str(row['url']).strip())
+            # URL → copia esatta
+            blocks = extract_fields_from_url(str(row['url']).strip())
         elif pd.notna(row.get('ean')):
             ean_str = re.sub(r"\D", "", str(row['ean']))
             fetched, _ = fetch_by_ean(ean_str)
-            src_text = f"[FONTE: EAN {ean_str}] " + fetched if fetched else ""
-
-        if src_text:
-            blocks = run_gemini_extraction(model, src_text)
+            if fetched:
+                blocks = run_gemini_extraction(model, f"[FONTE: EAN {ean_str}] {fetched}")
+            else:
+                blocks = {k: '' for k in ["titolo","descrizione_generale","modo_uso","ingredienti","avvertenze","formato","descrizione_breve"]}
         else:
             blocks = {
                 'titolo': str(row.get('titolo') or ''),
@@ -409,9 +493,13 @@ def ui_batch(model):
             }
 
         html_out = build_final_html(blocks)
-        short_out = trim_short_description(blocks.get("descrizione_breve", "") or blocks.get("descrizione_generale", ""))
+        short_out = normalize_short(blocks.get("descrizione_breve"), blocks.get("descrizione_generale"))
 
-        outputs.append({'row': idx, 'html': html_out, 'short': short_out})
+        outputs.append({
+            'row': idx,
+            'html': html_out,
+            'short': short_out
+        })
 
     st.success(f"Generati {len(outputs)} record.")
     if outputs:
