@@ -148,16 +148,16 @@ def run_gemini_to_html(model, source_text: str) -> str:
 
 def run_gemini_shortdesc(model, descr: str) -> str:
     """Crea una descrizione breve da zero (≤150 caratteri, senza punto finale)."""
-    mini = dedent(f\"\"\"\
+    mini = dedent(f"""
     Crea una descrizione breve (massimo 150 caratteri, senza punto finale) basata sul seguente testo.
     Non copiare letteralmente frasi intere: sintetizza in modo naturale.
     Testo:
     {descr}
-    \"\"\")
+    """)
     try:
         resp = model.generate_content(mini, request_options={"timeout": 30})
         s = (getattr(resp, "text", None) or str(resp)).strip()
-        s = re.sub(r"\\s+", " ", s).split("\\n")[0].strip()
+        s = re.sub(r"\s+", " ", s).split("\n")[0].strip()
         if len(s) > 150:
             s = s[:150]
             for sep in [",", ";", " "]:
@@ -167,8 +167,9 @@ def run_gemini_shortdesc(model, descr: str) -> str:
                     break
         return s.rstrip(" .")
     except Exception:
-        s = re.sub(r"\\s+", " ", (descr or "").strip())
+        s = re.sub(r"\s+", " ", (descr or "").strip())
         return s[:150].rstrip(" .")
+
 
 # ----------------------------
 # EAN SEARCH (NO GOOGLE API) — DuckDuckGo /lite + /html + robust extraction
