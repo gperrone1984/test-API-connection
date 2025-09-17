@@ -36,8 +36,10 @@ HEADERS = {
                   "Chrome/124.0 Safari/537.36"
 }
 
-# Prompt completo (Gemini può rispondere in HTML; poi lo normalizziamo)
-ITALIAN_PROMPT_PREAMBLE = dedent("""\
+# ----------------------------
+# Prompt (modello → solo HTML finale)
+# ----------------------------
+ITALIAN_PROMPT_PREAMBLE = dedent("""
 Dobbiamo creare la descrizione di un prodotto. Siamo di Redcare Pharmacy, una farmacia online.
 - Rimani fedele a quello che ti ho scritto.
 
@@ -62,24 +64,52 @@ Per i dispositivi medici se presenti aggiungi il Formato, Aggiungi <p><strong> p
 """)
 
 # ----------------------------
-# Helpers di formattazione / casing
+# Helpers formattazione / casing
 # ----------------------------
 def to_capitalized_case(text: str) -> str:
-    def fix_token(tok: str) -> str:
-        if not tok:
-            return tok
-        if re.fullmatch(r"[A-Z0-9]{2,}", tok):
-            return tok
-        base = re.sub(r"^([\\W_]*)(.*?)([\\W_]*)$", r"\\1:::\\2:::\\3", tok)
-        pre, core, post = base.split(":::")
-        if core.lower() in LOWER_WORDS_IT:
-            return f"{pre}{core.lower()}{post}"
-        return f"{pre}{core[:1].upper()}{core[1:].lower()}{post}"
-    tokens = re.split(r"(\\s+)", text.strip())
-    return ''.join([fix_token(t) if not t.isspace() else t for t in tokens])
+    """
+    Capitalized Case per titoli/parole:
+    - lascia intatte sigle 2+ lettere/numero tutte maiuscole (INCI, SPF, 3D, etc.)
+    - parole funzione in minuscolo (di, a, da, in, con, su, per, tra, fra, e, o, del...)
+    - preserva punteggiatura adiacente; niente backreference tipo \1\2\3
+    """
+    if not text:
+        return ""
+    tokens = re.split(r"(\s+)", text.strip())
+    out = []
+    for tok in tokens:
+        if tok.isspace():
+            out.append(tok)
+            continue
+
+        m = re.match(r"^([\W_]*)(.*?)([\W_]*)$", tok, flags=re.UNICODE | re.DOTALL)
+        if not m:
+            out.append(tok)
+            continue
+
+        pre, core, post = m.group(1), m.group(2), m.group(3)
+
+        if re.fullmatch(r"[A-Z0-9]{2,}", core):
+            fixed_core = core  # sigla → lascia
+        else:
+            # separa eventuali trattini/apostrofi interni
+            parts = re.split(r"([\-’'\\/])", core)
+            new_parts = []
+            for p in parts:
+                if re.fullmatch(r"[\-’'\\/]", p):
+                    new_parts.append(p)
+                else:
+                    if p.lower() in LOWER_WORDS_IT:
+                        new_parts.append(p.lower())
+                    else:
+                        new_parts.append(p[:1].upper() + p[1:].lower() if p else p)
+            fixed_core = "".join(new_parts)
+
+        out.append(f"{pre}{fixed_core}{post}")
+    return "".join(out)
 
 def remove_inner_br(text: str) -> str:
-    return re.sub(r"<\\s*br\\s*/?>", " ", text, flags=re.IGNORECASE)
+    return re.sub(r"<\s*br\s*/?>", " ", text or "", flags=re.IGNORECASE)
 
 def ensure_trailing_period(s: str) -> str:
     s = (s or "").strip()
@@ -90,7 +120,7 @@ def ensure_trailing_period(s: str) -> str:
 def to_capitalized_case_ingredients(s: str) -> str:
     if not s:
         return s
-    parts = re.split(r"\\s*[•\\u2022\\-\\–\\—]|,\\s*", s)
+    parts = re.split(r"\s*[•\u2022\-\–\—]|,\s*", s)
     cleaned = []
     for p in parts:
         p = p.strip()
@@ -100,7 +130,7 @@ def to_capitalized_case_ingredients(s: str) -> str:
         fixed = []
         for tok in tokens:
             if len(tok) <= 4 and tok.isupper():
-                fixed.append(tok)  # lascia INCI/sigle corte
+                fixed.append(tok)  # INCI/sigle corte → lascia
             else:
                 fixed.append(to_capitalized_case(tok))
         cleaned.append(" ".join(fixed))
@@ -110,7 +140,7 @@ def normalize_sentence_case(text: str) -> str:
     """Forza sempre il sentence case; preserva sigle di 2–4 lettere."""
     if not text:
         return ""
-    s = re.sub(r"\\s+", " ", text.strip()).lower()
+    s = re.sub(r"\s+", " ", text.strip()).lower()
     out = []
     cap_next = True
     for ch in s:
@@ -121,7 +151,7 @@ def normalize_sentence_case(text: str) -> str:
         if ch in ".!?":
             cap_next = True
     s = "".join(out)
-    s = re.sub(r"\\b([a-z]{2,4})\\b", lambda m: m.group(1).upper(), s)
+    s = re.sub(r"\b([a-z]{2,4})\b", lambda m: m.group(1).upper(), s)  # ripristina sigle corte
     return s.strip()
 
 # ----------------------------
@@ -139,10 +169,10 @@ def get_gemini_model(api_key: str, model_name: str = "gemini-1.5-flash"):
     return genai.GenerativeModel(model_name)
 
 def run_gemini_to_html(model, source_text: str) -> str:
-    prompt = f"{ITALIAN_PROMPT_PREAMBLE}\\n\\n{source_text}"
+    prompt = f"{ITALIAN_PROMPT_PREAMBLE}\n\n{source_text}"
     resp = model.generate_content(prompt, request_options={"timeout": 60})
     text = getattr(resp, 'text', None) or str(resp)
-    parts = re.findall(r"<p[\\s\\S]*?</p>", text, flags=re.IGNORECASE)
+    parts = re.findall(r"<p[\s\S]*?</p>", text, flags=re.IGNORECASE)
     html = " ".join(parts).strip() if parts else text.strip()
     return html
 
@@ -170,9 +200,8 @@ def run_gemini_shortdesc(model, descr: str) -> str:
         s = re.sub(r"\s+", " ", (descr or "").strip())
         return s[:150].rstrip(" .")
 
-
 # ----------------------------
-# EAN SEARCH (NO GOOGLE API) — DuckDuckGo /lite + /html + robust extraction
+# Ricerca EAN: DuckDuckGo /lite + /html (no Google API)
 # ----------------------------
 DDG_HEADERS = {"User-Agent": HEADERS["User-Agent"]}
 
@@ -187,7 +216,7 @@ def is_blacklisted(url: str) -> bool:
     return any(b in host for b in SEARCH_BLACKLIST)
 
 def duckduckgo_search_urls(query: str, max_results: int = 8) -> List[str]:
-    """Tenta prima la versione /lite (GET), poi /html (POST)."""
+    """Tenta prima /lite (GET), poi /html (POST)."""
     urls: List[str] = []
     try:
         r = requests.get("https://duckduckgo.com/lite/", params={"q": query}, headers=DDG_HEADERS, timeout=20)
@@ -241,8 +270,7 @@ def extract_jsonld_product(soup: BeautifulSoup) -> List[dict]:
 def extract_main_text_from_url(url: str, ean: Optional[str] = None) -> Tuple[str, bool]:
     """
     Ritorna (testo_estratto, match_affidabile_con_ean).
-    - Usa: <title>, meta description, JSON-LD Product (gtin/ean), e testo 'readable' (Readability).
-    - 'affidabile' = pagina contiene l'EAN (html/testo) oppure JSON-LD con GTIN uguale all'EAN.
+    Affidabile = pagina contiene l'EAN o JSON-LD Product con GTIN/ EAN uguale.
     """
     try:
         r = requests.get(url, timeout=25, headers=HEADERS)
@@ -257,7 +285,7 @@ def extract_main_text_from_url(url: str, ean: Optional[str] = None) -> Tuple[str
         if md and md.get("content"):
             meta_desc = md["content"].strip()
 
-        # JSON-LD Product (match GTIN/EAN)
+        # JSON-LD Product
         reliable = False
         jsonlds = extract_jsonld_product(soup_full)
         jsonld_bits = []
@@ -273,24 +301,24 @@ def extract_main_text_from_url(url: str, ean: Optional[str] = None) -> Tuple[str
                 if ean and any(ean in g for g in gtins):
                     reliable = True
                 if name or desc:
-                    jsonld_bits.append(f"Nome: {name}\\nDescrizione: {desc}")
+                    jsonld_bits.append(f"Nome: {name}\nDescrizione: {desc}")
 
-        # Readability main text
+        # Readability text
         doc = Document(html_full)
         html = doc.summary()
         soup = BeautifulSoup(html, 'lxml')
         for tag in soup(['script','style','noscript']):
             tag.decompose()
-        text_readable = re.sub(r"\\s+", " ", soup.get_text(" ")).strip()
+        text_readable = re.sub(r"\s+", " ", soup.get_text(" ")).strip()
 
         parts = []
         if title: parts.append(title)
         if meta_desc: parts.append(meta_desc)
-        if jsonld_bits: parts.append("\\n".join(jsonld_bits))
+        if jsonld_bits: parts.append("\n".join(jsonld_bits))
         if text_readable: parts.append(text_readable)
-        text = "\\n\\n".join(p for p in parts if p)[:12000]
+        text = "\n\n".join(p for p in parts if p)[:12000]
 
-        # match stringa EAN nella pagina (html o testo)
+        # match EAN nella pagina
         if ean and (ean in html_full or ean in text):
             reliable = True
 
@@ -332,22 +360,21 @@ def fetch_by_ean(ean: str) -> Tuple[str, Dict[str, Any]]:
             snippets.append(text)
             debug.append((u, "reliable"))
         else:
-            # prendi al massimo 2 fallback non affidabili
             if len([s for s in snippets if s.startswith("[FALLBACK]")]) < 2:
-                snippets.append("[FALLBACK]\\n" + text)
+                snippets.append("[FALLBACK]\n" + text)
                 debug.append((u, "fallback"))
         if good_hits >= 3:
             break
 
-    return ("\\n\\n".join(snippets), {"urls": urls, "good_hits": good_hits, "debug": debug})
+    return ("\n\n".join(snippets), {"urls": urls, "good_hits": good_hits, "debug": debug})
 
 # ----------------------------
 # Parsing HTML di Gemini → blocchi → normalizzazione → HTML finale
 # ----------------------------
 def parse_html_blocks(html: str) -> Dict[str, str]:
     """
-    Estrae: titolo, descrizione_generale (primo <p> dopo <strong><br>), e
-    Modo d'uso / Ingredienti / Avvertenze / Formato dagli altri <p>.
+    Estrae: titolo; descrizione_generale (testo del primo <p> al netto del <strong>);
+    e le sezioni Modo d'uso / Ingredienti / Avvertenze / Formato dai successivi <p>.
     """
     out = {"titolo": "", "descrizione_generale": "", "modo_uso": "", "ingredienti": "", "avvertenze": "", "formato": ""}
 
@@ -356,7 +383,7 @@ def parse_html_blocks(html: str) -> Dict[str, str]:
     if not ps:
         return out
 
-    # Primo paragrafo: titolo + descrizione
+    # Paragrafo 1: titolo + descrizione
     p0 = ps[0]
     strong = p0.find("strong")
     if strong:
@@ -365,9 +392,9 @@ def parse_html_blocks(html: str) -> Dict[str, str]:
     if out["titolo"]:
         text_p0 = text_p0.replace(out["titolo"], "", 1).strip()
     text_p0 = text_p0.lstrip(" :-")
-    out["descrizione_generale"] = re.sub(r"\\s+", " ", text_p0).strip()
+    out["descrizione_generale"] = re.sub(r"\s+", " ", text_p0).strip()
 
-    # Altri paragrafi con label
+    # Altri paragrafi
     for p in ps[1:]:
         label = ""
         strong = p.find("strong")
@@ -377,6 +404,7 @@ def parse_html_blocks(html: str) -> Dict[str, str]:
         if strong:
             content = content.replace(strong.get_text(" ").strip(), "", 1).strip()
         content = content.lstrip(": -").strip()
+
         if "modo d'uso" in label or "modalità d'uso" in label:
             out["modo_uso"] = content
         elif "ingredienti" in label or "inci" in label or "composizione" in label:
@@ -389,9 +417,9 @@ def parse_html_blocks(html: str) -> Dict[str, str]:
     return out
 
 def clean_format(value: str) -> str:
-    v = re.sub(r"\\s+", " ", (value or "").strip())
-    # accetta solo quantità reali (ml, g, l, capsule, compresse, pz, bustine, ecc.)
-    if re.search(r"\\b\\d+(?:[.,]\\d+)?\\s?(ml|g|kg|l|capsule|compresse|pz|bustine|sachets|tavolette)\\b", v, re.IGNORECASE):
+    v = re.sub(r"\s+", " ", (value or "").strip())
+    # Accetta solo quantità reali (ml, g, l, capsule, compresse, pz, bustine, ecc.)
+    if re.search(r"\b\d+(?:[.,]\d+)?\s?(ml|g|kg|l|capsule|compresse|pz|bustine|sachets|tavolette)\b", v, re.IGNORECASE):
         return ensure_trailing_period(v)
     return ""  # scarta COD/SKU ecc.
 
@@ -418,7 +446,7 @@ def build_final_html(blocks: Dict[str, str]) -> str:
     # Formato: quantità plausibili solo
     form = clean_format(form)
 
-    # Normalizza SEMPRE in sentence case (evita maiuscolo urlato)
+    # Normalizza sempre in sentence case (evita maiuscolo urlato)
     for name in ["descr", "modo", "avv", "form"]:
         locals()[name] = normalize_sentence_case(locals()[name])
 
@@ -440,7 +468,7 @@ def build_final_html(blocks: Dict[str, str]) -> str:
     return " ".join(parts)
 
 # ----------------------------
-# Generazione descrizione breve
+# Estrarre descrizione generale dall'HTML finale (per descrizione breve)
 # ----------------------------
 def extract_descr_from_html(html: str) -> str:
     try:
@@ -453,8 +481,8 @@ def extract_descr_from_html(html: str) -> str:
         if strong:
             strong_text = strong.get_text(" ").strip()
             text = text.replace(strong_text, "", 1).strip()
-        text = re.sub(r"^\\s*[:-]\\s*", "", text).strip()
-        return re.sub(r"\\s+", " ", text)
+        text = re.sub(r"^\s*[:-]\s*", "", text).strip()
+        return re.sub(r"\s+", " ", text)
     except Exception:
         return ""
 
@@ -469,9 +497,11 @@ def ui_single(model):
         url = st.text_input("Website URL", placeholder="https://…")
         manual_urls = st.text_area("URL aggiuntivi (uno per riga, es. sito produttore)", height=80, placeholder="https://…\nhttps://…")
     with col2:
-        ean = st.text_input("EAN (solo cifre)", placeholder="Es. 8001234567890")
+        ean_input = st.text_input("EAN (solo cifre)", placeholder="Es. 8001234567890")
+        # normalizza EAN (solo cifre)
+        ean = re.sub(r"\D", "", ean_input or "")
         confirm_ean = False
-        if ean and re.fullmatch(r"\\d{8,14}", ean) and not raw_text.strip() and not url.strip():
+        if ean and re.fullmatch(r"\d{8,14}", ean) and not raw_text.strip() and not url.strip():
             st.info(EAN_QUESTION)
             confirm_ean = st.checkbox("Sì, procedi", value=False)
         debug_mode = st.checkbox("Mostra debug ricerca", value=False)
@@ -479,6 +509,7 @@ def ui_single(model):
     build = st.button("Build Description", type="primary")
 
     if build:
+        # 1) Sorgente: testo, URL, EAN (in questo ordine)
         if raw_text.strip():
             source_text = raw_text.strip()
 
@@ -486,7 +517,7 @@ def ui_single(model):
             txt, _ = extract_main_text_from_url(url.strip(), ean=None)
             source_text = txt or " "
 
-        elif ean and re.fullmatch(r"\\d{8,14}", ean):
+        elif ean and re.fullmatch(r"\d{8,14}", ean):
             if not confirm_ean:
                 st.error(EAN_QUESTION)
                 st.stop()
@@ -502,11 +533,12 @@ def ui_single(model):
                         if t:
                             extra_texts.append(t)
             if extra_texts:
-                fetched = "\\n\\n".join(extra_texts + [fetched])
+                fetched = "\n\n".join(extra_texts + [fetched])
 
             if not fetched or meta.get("good_hits", 0) == 0:
                 st.error("Nessuna informazione trovata per questo EAN nel web.")
                 if debug_mode:
+                    st.markdown("### Debug ricerca EAN")
                     st.write(meta)
                 st.stop()
             source_text = fetched
@@ -518,15 +550,15 @@ def ui_single(model):
             st.warning("Inserisci almeno una sorgente valida (testo, URL o EAN).")
             st.stop()
 
-        # 1) Chiedi a Gemini l'HTML come da prompt
+        # 2) Chiedi a Gemini l'HTML come da prompt
         with st.spinner("Calling Gemini…"):
             html_raw = run_gemini_to_html(model, source_text)
 
-        # 2) Parsa/normalizza e ricostruisci nel formato esatto
+        # 3) Parsa/normalizza e ricostruisci nel formato esatto
         blocks = parse_html_blocks(html_raw)
         html_out = build_final_html(blocks)
 
-        # 3) Descrizione breve da zero sulla base della descrizione generale
+        # 4) Descrizione breve da zero sulla base della descrizione generale
         descr_for_short = blocks.get("descrizione_generale", "")
         short_out = run_gemini_shortdesc(model, descr_for_short)
 
@@ -552,10 +584,11 @@ def ui_batch(model):
         elif isinstance(row.get('url'), str) and row['url'].strip():
             src, _ = extract_main_text_from_url(str(row['url']).strip(), ean=None)
         elif pd.notna(row.get('ean')):
-            ean_str = re.sub(r"\\D", "", str(row['ean']))
-            fetched, meta = fetch_by_ean(ean_str)
-            if meta.get("good_hits", 0) > 0:
-                src = fetched
+            ean_str = re.sub(r"\D", "", str(row['ean']))
+            if re.fullmatch(r"\d{8,14}", ean_str):
+                fetched, meta = fetch_by_ean(ean_str)
+                if meta.get("good_hits", 0) > 0:
+                    src = fetched
 
         if not src:
             continue
