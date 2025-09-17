@@ -55,7 +55,7 @@ Per i dispositivi medici se presenti aggiungi il Formato, Aggiungi <p><strong> p
 - Restituisci SOLO i tag HTML finali come specificato sopra (nessun JSON, nessun testo extra, nessun commento).
 """)
 
-)\n"
+\n"
     "- NON aggiungere fonti nel testo.\n"
     "- Fai un passaggio per volta.\n"
     "- Il titolo è la parte prima di 'descrizione' o 'Indicazioni'. Il titolo deve essere in Capitalized Case.\n"
@@ -68,7 +68,7 @@ Per i dispositivi medici se presenti aggiungi il Formato, Aggiungi <p><strong> p
     "#Output richiesto\n"
     "Restituisci un JSON con le seguenti chiavi (usa stringhe vuote se mancanti):\n"
     "{\"titolo\": str, \"descrizione_generale\": str, \"modo_uso\": str, \"ingredienti\": str, \"avvertenze\": str, \"formato\": str, \"descrizione_breve\": str}"
-)
+
 
 ELEGANT_DIVIDER = """\n---\n"""
 
