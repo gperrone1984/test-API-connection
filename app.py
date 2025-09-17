@@ -1,26 +1,16 @@
-# streamlit_app.py
-# Requirements (install in your environment):
-#   streamlit
-#   google-generativeai>=0.7.0
-#   pandas
-#   requests
-#   beautifulsoup4
-#   lxml
-#   readability-lxml
-#   openpyxl
-
 import os
 import re
 import io
 import json
 import zipfile
-from typing import Dict, Tuple
+from typing import Optional, Tuple, Dict, Any, List
 
 import streamlit as st
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 from readability import Document
+from textwrap import dedent
 
 try:
     import google.generativeai as genai
@@ -29,7 +19,30 @@ except Exception:
 
 TITLE = "Product Description Builder (Gemini)"
 
-from textwrap import dedent
+ELEGANT_DIVIDER = "\n---\n"
+
+EAN_QUESTION = "Vuoi avere informazioni sul prodotto collegato a questo EAN?"
+
+LOWER_WORDS_IT = {
+    "di","a","da","in","con","su","per","tra","fra","e","o","dei","degli","delle",
+    "del","della","dell'","agli","alle","al","allo","ai","lo","la","le","il","un",
+    "uno","una","ed","od"
+}
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+}
+
+def get_api_key_from_env_or_secrets() -> Optional[str]:
+    if 'GOOGLE_API_KEY' in st.secrets:
+        return st.secrets['GOOGLE_API_KEY']
+    return os.getenv('GOOGLE_API_KEY')
+
+def get_gemini_model(api_key: str, model_name: str = "gemini-1.5-flash"):
+    if genai is None:
+        raise RuntimeError("google-generativeai non è installato.")
+    genai.configure(api_key=api_key)
+    return genai.GenerativeModel(model_name)
 
 ITALIAN_PROMPT_PREAMBLE = dedent("""\
 Dobbiamo creare la descrizione di un prodotto. Siamo di Redcare Pharmacy, una farmacia online.
@@ -54,29 +67,6 @@ Per i dispositivi medici se presenti aggiungi il Formato, Aggiungi <p><strong> p
 #ISTRUZIONI DI OUTPUT
 - Restituisci SOLO i tag HTML finali come specificato sopra (nessun JSON, nessun testo extra, nessun commento).
 """)
-
-\n"
-    "- NON aggiungere fonti nel testo.\n"
-    "- Fai un passaggio per volta.\n"
-    "- Il titolo è la parte prima di 'descrizione' o 'Indicazioni'. Il titolo deve essere in Capitalized Case.\n"
-    "- Sotto il titolo va la descrizione generale, senza l'etichetta 'descrizione'.\n"
-    "- Modo d'uso: se mancante usa la frase esatta: 'Per il corretto modo d'uso si prega di fare riferimento alla confezione'.\n"
-    "- Ingredienti: converti il testo degli ingredienti in Capitalized Case, in forma impersonale; se mancano usa la frase esatta: 'Per la lista completa degli ingredienti si prega di fare riferimento alla confezione'.\n"
-    "- Avvertenze: includi solo se presenti.\n"
-    "- Per i dispositivi medici, se presente, aggiungi il Formato.\n"
-    "- Aggiungi un breve riassunto (<150 caratteri) alla fine come 'descrizione breve' senza punto finale.\n\n"
-    "#Output richiesto\n"
-    "Restituisci un JSON con le seguenti chiavi (usa stringhe vuote se mancanti):\n"
-    "{\"titolo\": str, \"descrizione_generale\": str, \"modo_uso\": str, \"ingredienti\": str, \"avvertenze\": str, \"formato\": str, \"descrizione_breve\": str}"
-
-
-ELEGANT_DIVIDER = """\n---\n"""
-
-EAN_QUESTION = "Vuoi avere informazioni sul prodotto collegato a questo EAN?"
-
-HEADERS = {"User-Agent": "Mozilla/5.0"}
-
-LOWER_WORDS_IT = {"di","a","da","in","con","su","per","tra","fra","e","o","dei","degli","delle","del","della","dell'","agli","alle","al","allo","ai","lo","la","le","il","un","uno","una","ed","od"}
 
 
 def to_capitalized_case(text: str) -> str:
